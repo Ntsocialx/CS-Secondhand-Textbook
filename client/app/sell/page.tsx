@@ -11,7 +11,7 @@ const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000";
 export default function Sell() {
   const { data: session } = useSession();
   const router = useRouter();
-  const [form, setForm] = useState({ title: "", courseCode: "", price: "", condition: "Like New", description: "", campus: "Tshwane University of Technology (TUT)" });
+  const [form, setForm] = useState({ title: "", courseCode: "", price: "", condition: "Like New", description: "", campus: "Tshwane University of Technology (TUT)", category: "Textbook", isTrade: false, tradeRequest: "" });
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
@@ -40,7 +40,7 @@ export default function Sell() {
       const payload = await fetchJson<{ listing: { id: string } }>(`${apiUrl}/api/listings`, withBearer(session.user.accessToken, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...form, price: Number(form.price), imageUrl }),
+        body: JSON.stringify({ ...form, price: form.isTrade ? null : Number(form.price), imageUrl }),
       }));
       router.push(`/books/${payload.listing.id}`);
     } catch (error) {

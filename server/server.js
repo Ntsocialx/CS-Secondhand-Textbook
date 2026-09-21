@@ -189,16 +189,24 @@ const CONDITIONS = new Set(['Like New', 'Good', 'Acceptable', 'Worn']);
 const normalizeListing = (body) => ({
   title: String(body?.title || '').trim().slice(0, 200),
   courseCode: String(body?.courseCode || '').trim().toUpperCase().slice(0, 30),
-  price: Number(body?.price),
+  price: body?.price !== undefined ? Number(body.price) : null,
   condition: String(body?.condition || '').trim(),
   description: String(body?.description || '').trim().slice(0, 2000),
   campus: String(body?.campus || '').trim().slice(0, 120),
   imageUrl: typeof body?.imageUrl === 'string' ? body.imageUrl.slice(0, 2_000_000) : null,
+  category: String(body?.category || 'Textbook').trim().slice(0, 100),
+  isTrade: Boolean(body?.isTrade),
+  tradeRequest: String(body?.tradeRequest || '').trim().slice(0, 2000),
 });
 
 const validateListing = (listing) => {
   if (!listing.title || !listing.courseCode || !listing.campus || !listing.description) return 'Title, course code, campus, and description are required.';
-  if (!Number.isFinite(listing.price) || listing.price < 0 || listing.price > 100000) return 'Price must be a valid amount between R0 and R100000.';
+  if (!['Textbook', 'Bible', 'Comic Book', 'Manga'].includes(listing.category)) return 'Please choose a valid category.';
+  if (!listing.isTrade) {
+    if (!Number.isFinite(listing.price) || listing.price < 0 || listing.price > 100000) return 'Price must be a valid amount between R0 and R100000.';
+  } else {
+    if (!listing.tradeRequest || listing.tradeRequest.trim().length < 5) return 'Please provide a valid trade request (at least 5 characters).';
+  }
   if (!CONDITIONS.has(listing.condition)) return 'Choose a valid book condition.';
   if (listing.imageUrl && !/^https?:\/\/|^\/|^data:image\/(png|jpe?g|webp);base64,/.test(listing.imageUrl)) return 'The textbook image format is not supported.';
   return null;
@@ -223,7 +231,7 @@ app.get('/api/listings', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, title, course_code AS "courseCode", price::text, condition, description, campus,
-              image_url AS "imageUrl", status, created_at AS "createdAt", user_id AS "userId"
+              image_url AS "imageUrl", status, created_at AS "createdAt", user_id AS "userId", category, is_trade AS "isTrade", trade_request AS "tradeRequest"
        FROM listings WHERE ${filters.join(' AND ')} ORDER BY created_at DESC`,
       values,
     );
@@ -263,7 +271,7 @@ app.get('/api/listings/:id', authenticate, async (req, res) => {
       `SELECT l.id, l.title, l.course_code AS "courseCode", l.price::text, l.condition, l.description,
               l.campus, l.image_url AS "imageUrl", l.status, l.created_at AS "createdAt",
               u.id AS "userId", u.email AS "sellerEmail", u.phone AS "sellerPhone",
-              u.contact_display_consent AS "contactDisplayConsent"
+              u.contact_display_consent AS "contactDisplayConsent", l.category, l.is_trade AS "isTrade", l.trade_request AS "tradeRequest"
        FROM listings l JOIN users u ON u.id = l.user_id WHERE l.id = $1`,
       [req.params.id],
     );
@@ -285,7 +293,7 @@ app.get('/api/my-listings', authenticate, async (req, res) => {
   if (!requireConfiguration(res)) return;
   const result = await pool.query(
     `SELECT id, title, course_code AS "courseCode", price::text, condition, description, campus,
-            image_url AS "imageUrl", status, created_at AS "createdAt"
+            image_url AS "imageUrl", status, created_at AS "createdAt", category, is_trade AS "isTrade", trade_request AS "tradeRequest"
      FROM listings WHERE user_id = $1 ORDER BY created_at DESC`,
     [req.user.sub],
   );
@@ -299,11 +307,11 @@ app.post('/api/listings', authenticate, async (req, res) => {
   if (validationError) return res.status(400).json({ error: validationError });
   try {
     const result = await pool.query(
-      `INSERT INTO listings (user_id, title, course_code, price, condition, description, campus, image_url)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO listings (user_id, title, course_code, price, condition, description, campus, image_url, category, is_trade, trade_request)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING id, title, course_code AS "courseCode", price::text, condition, description, campus,
-               image_url AS "imageUrl", status, created_at AS "createdAt"`,
-      [req.user.sub, listing.title, listing.courseCode, listing.price, listing.condition, listing.description, listing.campus, listing.imageUrl],
+               image_url AS "imageUrl", status, created_at AS "createdAt", category, is_trade AS "isTrade", trade_request AS "tradeRequest"`,
+      [req.user.sub, listing.title, listing.courseCode, listing.price, listing.condition, listing.description, listing.campus, listing.imageUrl, listing.category, listing.isTrade, listing.tradeRequest],
     );
     return res.status(201).json({ listing: result.rows[0] });
   } catch (error) {
@@ -364,6 +372,9 @@ app.post('/api/reports', async (req, res) => {
   }
   try {
     const reporterId = req.user ? req.user.sub : null;
+    if (category === 'Scam') {
+      console.log(`[SECURITY ALERT] Scam report filed for listing ${listingId || 'N/A'} by ${reporterEmail || 'Anonymous'}`);
+    }
     await pool.query(
       `INSERT INTO reports (reporter_id, reporter_email, listing_id, user_id, category, description)
        VALUES ($1, $2, $3, $4, $5, $6)`,

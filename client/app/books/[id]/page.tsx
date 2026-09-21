@@ -37,6 +37,8 @@ export default function BookDetails() {
             imageUrl: preview.image,
             status: "ACTIVE",
             createdAt: new Date().toISOString(),
+            category: "Textbook",
+            isTrade: false,
           });
           return;
         }
@@ -48,7 +50,7 @@ export default function BookDetails() {
   const displayedListing = listing ?? (preview ? {
     id: preview.id, title: preview.title, courseCode: preview.course, price: preview.price,
     condition: preview.condition as Listing["condition"], description: "Preview listing from the Campus Exchange catalogue. Contact the seller to confirm availability and arrange a safe campus meetup.",
-    campus: preview.campus, imageUrl: preview.image, status: "ACTIVE" as const, createdAt: new Date().toISOString(),
+    campus: preview.campus, imageUrl: preview.image, status: "ACTIVE" as const, createdAt: new Date().toISOString(), category: "Textbook", isTrade: false,
   } : null);
   if (loading) return <div className="flex min-h-screen items-center justify-center bg-[#f7f9fc] text-xs text-[#718198]">Loading listing...</div>;
   if (error || !displayedListing) return <div className="flex min-h-screen flex-col bg-[#f7f9fc] text-[#142039]"><Header active="Browse" /><main className="flex flex-1 items-center justify-center"><div className="text-center"><p className="text-sm font-bold">{error || "Listing not found."}</p><Link href="/browse" className="mt-4 inline-block text-xs text-[#2864ed]">Back to Browse</Link></div></main></div>;

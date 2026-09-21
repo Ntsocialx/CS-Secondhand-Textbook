@@ -41,19 +41,16 @@ export function Header({ active = "Home" }: { active?: string }) {
         <div className="flex items-center gap-4 text-[#64748b]">
           {session?.user?.firstName ? (
             <div className="flex items-center gap-3">
-              <span className="hidden sm:inline text-[10px] font-bold text-[#142039]">Welcome, {session.user.firstName}!</span>
-              <button
-                onClick={() => signOut({ callbackUrl: '/' })}
-                className="text-[10px] font-bold text-[#e45757] hover:underline"
-              >
-                Log out
-              </button>
+              <span className="hidden sm:inline text-[10px] font-bold text-[#142039]">Welcome back, {session.user.firstName}!</span>
+              <Link href="/profile" className="text-[10px] font-bold text-[#2864ed] hover:underline">Edit Profile</Link>
             </div>
           ) : (
             <Link href="/login" className="hidden text-[10px] font-bold text-[#2864ed] sm:block">Sign in</Link>
           )}
           <span className="flex h-7 w-7 items-center justify-center rounded-full border border-[#e5eaf2] text-xs">♧</span>
-          <span className="flex h-7 w-7 items-center justify-center rounded-full bg-[#b88956] text-[10px] font-bold text-white">T</span>
+          <span className="flex h-7 w-7 items-center justify-center rounded-full bg-[#b88956] text-[10px] font-bold text-white">
+            {session?.user?.firstName ? session.user.firstName[0].toUpperCase() : "T"}
+          </span>
           <span className="text-[10px]">⌄</span>
         </div>
       </div>
@@ -73,7 +70,7 @@ export function BookCover({ book, large = false }: { book: { shortTitle: string;
       ) : (
         <>
           <Image
-            src={`https://images.unsplash.com/photo-1544716278-e877dfb78fbc?q=80&w=400&auto=format&fit=crop`}
+            src="https://images.unsplash.com/photo-1521587760476-6c12a4b040da?q=80&w=400&auto=format&fit=crop"
             alt="Textbook placeholder"
             fill
             className="object-cover opacity-30"
