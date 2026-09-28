@@ -25,6 +25,52 @@ body {
   font-family: Arial, Helvetica, sans-serif;
 }
 
+/* Accessible focus outline for keyboard users */
+:focus {
+  outline: none; /* remove default focus for browsers that don't support :focus-visible */
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 4px rgba(40,100,237,0.14);
+  border-radius: 6px;
+}
+
+/* Skip-link (visually hidden but visible on keyboard focus) */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: auto;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
+
+.skip-link:focus,
+.skip-link:active {
+  position: fixed;
+  left: 16px;
+  top: 16px;
+  width: auto;
+  height: auto;
+  padding: 8px 12px;
+  background: #ffffff;
+  color: #142039;
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(34,61,102,0.12);
+  z-index: 9999;
+}
+
+/* Respect users who prefer reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 button,
 a,
 select {

@@ -28,12 +28,16 @@ In scope: registration with an approved student email domain (`student.tut.ac.za
 `tut.ac.za`), POPIA consent + cookie choice, failed-login lockout, protected marketplace
 routes, listing creation + image upload, browsing/filtering, seller contact reveal, mark as
 sold, exchange request/confirmation, report listing/user, meetup safety guidance, admin
-visitor analytics, responsive Figma-aligned UI.
+visitor analytics, manual R5-per-listing monthly fee via bank transfer, private proof upload,
+admin payment/content review before publication, marketplace rules, responsive classified
+listings UI, and Gumtree-inspired (not copied) marketplace information architecture.
 
 Out of scope (needs a separately approved scope change): online payments, delivery/shipping/
 tracking, real-time chat or WebSockets, price negotiation workflows, ratings/reviews/seller
-feedback scores, complex checkout flows, social feeds/follower systems, unnecessary
-state-management libraries or UI kits.
+feedback scores, card collection or payment gateways, automatic recurring payments, complex
+checkout flows, social feeds/follower systems, unnecessary state-management libraries or UI
+kits. The listing fee is paid manually outside the site; the portal only accepts private
+proof for admin review.
 
 Do not overbuild. Known gaps: listing pages, sell form, browse filters, My Listings, seller
 contact reveal, exchange requests, and reports are currently UI-only or backed by static mock
@@ -65,13 +69,19 @@ set.
 
 ## 5. Data model
 
-Current tables: `users`, `visitor_events`. Missing and required before the gaps above close:
-listings, reports, exchanges, and consent audit history tables.
+Tables include `users`, `visitor_events`, `listings`, `reports`, `exchanges`,
+`listing_payment_proofs`, `listing_review_events`, `report_review_events`,
+`password_reset_tokens`, `password_reset_requests`, and `password_reset_attempts`. Consent
+audit history remains a separate requirement.
 
 Required before saving:
-- Listing: title, course code, price, condition, description, university/campus, owner
-  (student who is authenticated) — a student can never create a listing on behalf of another
-  user.
+- Listing: title, course code, sale price or exchange request, condition, description,
+  category, campus, authenticated owner, marketplace policy version/acknowledgement,
+  separate payment/moderation states, and optional expiry.
+- Payment proof: private listing association, authenticated uploader, verified file type,
+  original safe display name, bytes, and timestamp. Proof bytes are never returned in public
+  listing APIs.
+- Review event: listing, actor, event type, decision, reason/checklist, and timestamp.
 - Report: category, description, reporter identity (when authenticated), target listing/user,
   timestamp — reporter must never be exposed publicly.
 - Consent: version + timestamp recorded at registration/login; contact-display consent is
@@ -79,14 +89,60 @@ Required before saving:
 
 ## 6. API contracts
 
-No committed route table exists yet beyond auth — pin exact paths + HTTP methods here as each
-sprint's endpoints (listings, contact reveal, exchange requests, reports) are implemented, and
-keep this section in sync with the code.
+Implemented listing/payment/review routes:
+- `GET /api/public/listings` — latest six active, approved, unexpired public listings; no
+  seller contact, payment, or review data.
+- `GET /api/listing-payment-instructions` — authenticated seller gets configured manual
+  transfer details and the R5/30-day terms; fails explicitly when account configuration is
+  missing.
+- `GET /api/listings` — authenticated browse/search/filter (`q`, `category`, `courseCode`,
+  `campus`, `condition`, `isTrade`, `minPrice`, `maxPrice`, `sort`); active, unexpired
+  listings only.
+- `GET /api/listings/:id` — authenticated active listing detail only.
+- `GET /api/listings/:id/contact` — authenticated explicit contact reveal for an active
+  listing, subject to seller consent.
+- `GET /api/my-listings` and `GET /api/my-listings/:id` — owner-only listing status and edit
+  data; no proof bytes.
+- `POST /api/listings` — create private pending listing and record policy acknowledgement.
+- `PATCH /api/listings/:id` — owner edits; returns the listing to content review.
+- `POST /api/listings/:id/payment-proof` — owner uploads a private JPEG, PNG, or PDF proof
+  (maximum 5 MiB).
+- `POST /api/listings/:id/renew` — owner starts a new fee/review period for an expired item.
+- `POST /api/listings/:id/sold` — owner marks their active listing sold.
+- `GET /api/admin/listings/review-queue` — `ADMIN` only; pending payment/content work.
+- `GET /api/admin/listings/:id/payment-proof` — `ADMIN` only; private inline proof content.
+- `POST /api/admin/listings/:id/payment-review` — `ADMIN` verifies or rejects proof.
+- `POST /api/admin/listings/:id/moderation-review` — `ADMIN` approves or rejects content
+  against the complete server-validated checklist.
+- `GET /api/admin/overview` — `ADMIN` only; aggregate user, listing, report, fee-period, and
+  visitor metrics with no proof bytes or individual user contact fields.
+- `GET /api/admin/fee-periods` — `ADMIN` only; paginated/filterable R5 manual fee-period
+  statuses; no proof bytes.
+- `GET /api/admin/reports` (and legacy `GET /api/reports`) — `ADMIN` only; report queue.
+- `PATCH /api/admin/reports/:id` — `ADMIN` only; transition OPEN to REVIEWED/RESOLVED or
+  REVIEWED to RESOLVED, recording an internal audit event.
+- `GET /api/analytics/summary` — `ADMIN` only; aggregate visitor analytics.
+- `POST /api/exchanges` — creates an exchange request only for an approved, active,
+  unexpired listing.
+
+Keep these contracts synchronized with the Express implementation. Other existing APIs
+include auth, analytics, reports, and exchanges.
+
+Password recovery contracts:
+- `POST /api/auth/password-reset/request` — public; accepts a student email and returns
+  generic instructions without confirming account existence.
+- `POST /api/auth/password-reset/complete` — public; consumes a single-use 30-minute token
+  and updates only the password hash/session version.
+- Same-origin Next.js proxy paths:
+  `/api/auth/password-reset/request` and `/api/auth/password-reset/complete`.
 
 ## 7. Security
 
-Never expose to the browser: raw seller phone numbers or private email addresses in public
-listing responses, database credentials, JWT signing secret, admin role checks.
+Never expose in public listing responses: raw seller phone numbers/private email addresses,
+payment proof bytes/URLs, or admin review notes. Never expose database credentials, JWT
+signing secret, or admin role checks. Review notes are visible only to the listing owner and
+authorized admins. Receiving-account details are shown only in the authenticated seller
+payment-instructions flow and must be configured outside source control.
 
 Never run from the browser: password hashing, login-lockout enforcement, contact-reveal
 authorization, report-target visibility rules.
@@ -98,7 +154,26 @@ Specific rules:
 - Contact details are returned only after an authenticated, explicit reveal request, and the
   reveal action must be auditable.
 - Admin endpoints must validate the `ADMIN` role server-side — never trust a client-side role
-  check.
+  check. The server checks the user's current database role so revocation takes effect for
+  subsequent admin API requests.
+- `/admin` pages require an `ADMIN` session at middleware and page boundaries; private data
+  and actions additionally require server authorization.
+- Admin accounts are promoted only by a server-host CLI command for an existing account;
+  do not seed shared credentials or place passwords in source control.
+- Password-reset tokens are high-entropy, stored only as hashes, single-use, 30-minute
+  expiry, and excluded from logs. Reset requests use generic responses and hashed per-email
+  and per-IP throttling. SMTP secrets and canonical HTTPS site URL are server-only.
+- Password reset increments a per-user password version, invalidating existing API access
+  tokens on their next request. It never changes the user's role.
+- Only a listing with verified payment and approved moderation content may become publicly
+  `ACTIVE`; public listing/detail/contact APIs must also hide expired listings.
+- Payment verification and content approval are separate auditable decisions; only the
+  authenticated owner may upload proof or edit a listing.
+- Listing proof is validated from file bytes, stored privately, and served only to an
+  authenticated admin with `Cache-Control: private, no-store`.
+- Marketplace rules are product policy copy, not legal advice and not a promise to avoid
+  lawsuits. Final terms, payment/refund handling, privacy and retention wording require
+  owner and qualified legal review before production.
 
 ## 8. Code standards
 

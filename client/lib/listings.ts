@@ -7,12 +7,14 @@ export type Listing = {
   description: string;
   campus: string;
   imageUrl: string | null;
-  status: "ACTIVE" | "SOLD";
+  status: "ACTIVE" | "SOLD" | "PENDING_PAYMENT" | "PENDING_PAYMENT_REVIEW" | "PENDING_CONTENT_REVIEW" | "REJECTED" | "EXPIRED" | "WITHDRAWN";
   createdAt: string;
+  paymentStatus?: "DUE" | "SUBMITTED" | "VERIFIED" | "REJECTED";
+  moderationStatus?: "PENDING" | "APPROVED" | "REJECTED";
+  paymentReviewReason?: string | null;
+  moderationReviewReason?: string | null;
+  expiresAt?: string | null;
   userId?: string;
-  sellerEmail?: string;
-  sellerPhone?: string | null;
-  contactDisplayConsent?: boolean;
   category: string;
   isTrade: boolean;
   tradeRequest?: string;

@@ -26,8 +26,10 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">
-        <AuthSessionProvider>{children}<CookieConsent /></AuthSessionProvider>
-      </body>
+            <a id="skip-main" href="#main" className="skip-link">Skip to main content</a>
+            <AuthSessionProvider>{children}<CookieConsent /></AuthSessionProvider>
+            <script dangerouslySetInnerHTML={{__html: `document.addEventListener('click', function (e) { if (e.target && (e.target.id === 'skip-main' || e.target.closest && e.target.closest('#skip-main'))) { e.preventDefault(); var m = document.querySelector('main'); if (m) { m.setAttribute('tabindex', '-1'); m.focus(); } } }, {capture: true});`}} />
+          </body>
     </html>
   );
 }

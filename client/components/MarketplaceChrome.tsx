@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import Image from "next/image";
-import { useSession, signOut } from "next-auth/react";
+import { useSession } from "next-auth/react";
 
 export function Logo() {
   return (
@@ -37,6 +37,9 @@ export function Header({ active = "Home" }: { active?: string }) {
               {item}
             </Link>
           ))}
+          {session?.user?.role === "ADMIN" && (
+            <Link href="/admin" className="py-4 font-bold text-[#2864ed] hover:text-[#173fae]">Admin</Link>
+          )}
         </nav>
         <div className="flex items-center gap-4 text-[#64748b]">
           {session?.user?.firstName ? (

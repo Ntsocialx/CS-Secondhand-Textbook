@@ -121,6 +121,7 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
       <ConsentModal accepted={accepted} userAgreement={userAgreement} displayContactDetails={displayContactDetails} onAcceptedChange={setAccepted} onUserAgreementChange={setUserAgreement} onDisplayContactDetailsChange={setDisplayContactDetails} />
       {message && <p role="alert" className="rounded-lg bg-[#fff0bf] p-3 text-[10px] font-bold text-[#9a5d09]">{message}</p>}
       <button disabled={busy} className="w-full rounded-lg bg-[#2864ed] px-4 py-3 text-xs font-bold text-white hover:bg-[#174fcf] disabled:opacity-50">{busy ? "Please wait..." : mode === "register" ? "Create student account" : "Sign in to Campus Exchange"}</button>
+      {mode === "login" && <p className="text-center text-[10px]"><Link href="/forgot-password" className="font-bold text-[#2864ed]">Forgot password?</Link></p>}
       <p className="text-center text-[10px] text-[#718198]">{mode === "register" ? "Already have an account?" : "New to Campus Exchange?"} <Link href={mode === "register" ? "/login" : "/register"} className="font-bold text-[#2864ed]">{mode === "register" ? "Sign in" : "Create an account"}</Link></p>
     </form>
   );

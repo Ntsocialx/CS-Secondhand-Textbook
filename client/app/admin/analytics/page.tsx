@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useSession } from "next-auth/react";
 import { useEffect, useState } from "react";
 import { fetchJson } from "@/lib/api";
+import { AdminNavigation } from "@/components/AdminNavigation";
 
 type Summary = {
   totals: { visits: number; visitors: number };
@@ -37,6 +38,8 @@ export default function AnalyticsPage() {
       <div className="mx-auto max-w-5xl">
         <Link href="/" className="text-sm font-semibold text-indigo-600">← Campus Exchange</Link>
         <h1 className="mt-5 text-4xl font-semibold">Visitor analytics</h1>
+        <Link href="/admin" className="mt-3 inline-block text-sm font-semibold text-indigo-600">← Admin control center</Link>
+        <div className="mt-5"><AdminNavigation active="/admin/analytics" /></div>
         <p className="mt-2 text-slate-600">Private dashboard. IP addresses are stored only as salted hashes.</p>
         {error && <p className="mt-6 rounded-xl bg-red-50 p-4 text-red-700">{error}</p>}
         {summary && (

@@ -1,5 +1,13 @@
 export async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(url, options);
+  let response: Response;
+  try {
+    response = await fetch(url, options);
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error("Unable to connect to the marketplace API. Check that the Express server is running.");
+    }
+    throw error;
+  }
   if (!response.ok) {
     const contentType = response.headers.get("content-type");
     if (contentType?.includes("application/json")) {

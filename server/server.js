@@ -4,12 +4,22 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET;
 const POPIA_CONSENT_VERSION = '1.0';
+const LISTING_POLICY_VERSION = '2026-09';
+const LISTING_REVIEW_CHECKLIST_ITEMS = 5;
+const LISTING_FEE_CENTS = 500;
+const isValidListingId = (id) => /^[1-9]\d{0,17}$/.test(String(id));
+const MAX_PAYMENT_PROOF_BYTES = 5 * 1024 * 1024;
+const PASSWORD_RESET_TOKEN_TTL_MINUTES = 30;
+const PASSWORD_RESET_REQUESTS_PER_EMAIL_HOUR = 3;
+const PASSWORD_RESET_REQUESTS_PER_IP_HOUR = 10;
+const PASSWORD_RESET_COMPLETIONS_PER_IP_HOUR = 20;
 const ALLOWED_EMAIL_DOMAINS = ['student.tut.ac.za', 'tut.ac.za', 'tut4life.ac.za', 'student.campus.edu'];
 const LOGIN_FAILURE_LIMIT = 5;
 const LOGIN_LOCKOUT_MS = 5 * 60 * 1000;
@@ -22,7 +32,7 @@ const pool = process.env.DATABASE_URL
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '8mb' }));
 
 const requireConfiguration = (res) => {
   if (!pool || !JWT_SECRET) {
@@ -86,12 +96,12 @@ const hashVisitorIp = (req) => crypto
   .digest('hex');
 
 const createAccessToken = (user) => jwt.sign(
-  { sub: user.id, email: user.email, role: user.role },
+  { sub: user.id, email: user.email, role: user.role, passwordVersion: Number(user.password_version || 0) },
   JWT_SECRET,
   { expiresIn: '8h' },
 );
 
-const authenticate = (req, res, next) => {
+const authenticate = async (req, res, next) => {
   if (!JWT_SECRET) {
     return res.status(503).json({ error: 'The authentication service is not configured.' });
   }
@@ -100,16 +110,94 @@ const authenticate = (req, res, next) => {
   if (!token) return res.status(401).json({ error: 'Authentication required.' });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
+    if (!pool) return res.status(503).json({ error: 'The authentication service is not configured.' });
+    const result = await pool.query('SELECT password_version FROM users WHERE id = $1', [req.user.sub]);
+    if (!result.rows[0] || Number(result.rows[0].password_version) !== Number(req.user.passwordVersion || 0)) {
+      return res.status(401).json({ error: 'Invalid or expired session.' });
+    }
     return next();
-  } catch {
-    return res.status(401).json({ error: 'Invalid or expired session.' });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return res.status(401).json({ error: 'Invalid or expired session.' });
+    }
+    console.error('Session verification failed:', error);
+    return res.status(503).json({ error: 'Unable to verify the session.' });
   }
 };
 
-const requireAdmin = (req, res, next) => {
-  if (req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin access required.' });
-  return next();
+const requireAdmin = async (req, res, next) => {
+  if (!pool) return res.status(503).json({ error: 'Admin storage is not configured.' });
+  try {
+    const result = await pool.query('SELECT role FROM users WHERE id = $1', [req.user.sub]);
+    if (!result.rows[0]) return res.status(401).json({ error: 'Account not found.' });
+    if (result.rows[0].role !== 'ADMIN') return res.status(403).json({ error: 'Admin access required.' });
+    req.user.role = 'ADMIN';
+    return next();
+  } catch (error) {
+    console.error('Admin authorization failed:', error);
+    return res.status(500).json({ error: 'Unable to verify admin access.' });
+  }
 };
+
+const getPaymentInstructions = () => {
+  const account = {
+    accountHolder: process.env.LISTING_PAYMENT_ACCOUNT_HOLDER,
+    bank: process.env.LISTING_PAYMENT_BANK,
+    accountNumber: process.env.LISTING_PAYMENT_ACCOUNT_NUMBER,
+    accountType: process.env.LISTING_PAYMENT_ACCOUNT_TYPE,
+  };
+  if (Object.values(account).some((value) => !value || !value.trim())) return null;
+  return { fee: (LISTING_FEE_CENTS / 100).toFixed(2), currency: 'ZAR', periodDays: 30, ...account };
+};
+
+const getPaymentProofFile = (dataUrl) => {
+  if (typeof dataUrl !== 'string') return null;
+  const match = dataUrl.match(/^data:(image\/jpeg|image\/png|application\/pdf);base64,([A-Za-z0-9+/]+={0,2})$/);
+  if (!match) return null;
+  const data = Buffer.from(match[2], 'base64');
+  if (!data.length || data.length > MAX_PAYMENT_PROOF_BYTES) return null;
+  const signatures = {
+    'image/jpeg': data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff,
+    'image/png': data.length >= 8 && data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+    'application/pdf': data.subarray(0, 5).toString('ascii') === '%PDF-',
+  };
+  if (!signatures[match[1]]) return null;
+  return { mimeType: match[1], data };
+};
+
+const hashResetValue = (value) => crypto.createHash('sha256').update(value).digest('hex');
+const hashResetRateKey = (value) => crypto
+  .createHmac('sha256', process.env.PASSWORD_RESET_HASH_SECRET || JWT_SECRET || 'unconfigured-reset-secret')
+  .update(value)
+  .digest('hex');
+
+const getPasswordResetMailer = () => {
+  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM } = process.env;
+  const port = Number(SMTP_PORT);
+  if (!SMTP_HOST || !Number.isInteger(port) || port < 1 || port > 65535
+      || !SMTP_USER || !SMTP_PASSWORD || !SMTP_FROM) return null;
+  return nodemailer.createTransport({
+    host: SMTP_HOST,
+    port,
+    secure: port === 465,
+    auth: { user: SMTP_USER, pass: SMTP_PASSWORD },
+  });
+};
+
+const getPasswordResetBaseUrl = () => {
+  const configuredUrl = process.env.PASSWORD_RESET_BASE_URL;
+  if (!configuredUrl) return null;
+  try {
+    const url = new URL(configuredUrl);
+    const isLocalHttp = url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname);
+    if (url.protocol !== 'https:' && !isLocalHttp) return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
+};
+
+const passwordResetMessage = 'If an account exists for that email, password reset instructions will be sent shortly.';
 
 app.post('/api/auth/register', async (req, res) => {
   if (!requireConfiguration(res)) return;
@@ -142,6 +230,175 @@ app.post('/api/auth/register', async (req, res) => {
     if (error.code === '23505') return res.status(409).json({ error: 'An account already exists for this email.' });
     console.error('Registration failed:', error);
     return res.status(500).json({ error: 'Unable to create the account.' });
+  }
+});
+
+app.post('/api/auth/password-reset/request', async (req, res) => {
+  if (!pool || !JWT_SECRET) {
+    return res.status(503).json({ error: 'Password reset is temporarily unavailable. Please try again later.' });
+  }
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (email.length > 254 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return res.status(202).json({ message: passwordResetMessage });
+  }
+  const baseUrl = getPasswordResetBaseUrl();
+  const mailer = getPasswordResetMailer();
+  if (!baseUrl || !mailer || (process.env.PASSWORD_RESET_HASH_SECRET || '').length < 32) {
+    console.error('Password reset unavailable: canonical URL, SMTP, or reset hash secret is not configured.');
+    return res.status(503).json({ error: 'Password reset is temporarily unavailable. Please try again later.' });
+  }
+  const emailKey = hashResetRateKey(email);
+  const ipKey = hashResetRateKey(String(req.ip || 'unknown'));
+  const token = crypto.randomBytes(32).toString('hex');
+  try {
+    const client = await pool.connect();
+    let user;
+    try {
+      await client.query('BEGIN');
+      const lockKeys = [emailKey, ipKey].sort();
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1)), pg_advisory_xact_lock(hashtext($2))', lockKeys);
+      await client.query(
+        `DELETE FROM password_reset_tokens
+         WHERE expires_at < NOW() - INTERVAL '7 days'
+            OR consumed_at < NOW() - INTERVAL '7 days'`,
+      );
+      await client.query(`DELETE FROM password_reset_requests WHERE created_at < NOW() - INTERVAL '2 days'`);
+      await client.query(`DELETE FROM password_reset_attempts WHERE created_at < NOW() - INTERVAL '2 days'`);
+      const rate = await client.query(
+        `SELECT COUNT(*) FILTER (WHERE email_key = $1)::int AS email_count,
+                COUNT(*) FILTER (WHERE ip_key = $2)::int AS ip_count
+         FROM password_reset_requests
+         WHERE created_at >= NOW() - INTERVAL '1 hour'`,
+        [emailKey, ipKey],
+      );
+      const limited = rate.rows[0].email_count >= PASSWORD_RESET_REQUESTS_PER_EMAIL_HOUR
+        || rate.rows[0].ip_count >= PASSWORD_RESET_REQUESTS_PER_IP_HOUR;
+      await client.query(
+        `INSERT INTO password_reset_requests (email_key, ip_key)
+         VALUES ($1, $2)`,
+        [emailKey, ipKey],
+      );
+      if (!limited) {
+        const userResult = await client.query(`SELECT id, email FROM users WHERE email = $1`, [email]);
+        user = userResult.rows[0];
+        if (user) {
+          await client.query(
+            `UPDATE password_reset_tokens SET consumed_at = NOW()
+             WHERE user_id = $1 AND consumed_at IS NULL`,
+            [user.id],
+          );
+          await client.query(
+            `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+             VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 minute'))`,
+            [user.id, hashResetValue(token), PASSWORD_RESET_TOKEN_TTL_MINUTES],
+          );
+        }
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    if (user) {
+      const resetUrl = new URL('/reset-password', baseUrl);
+      resetUrl.searchParams.set('token', token);
+      setImmediate(() => {
+        Promise.resolve().then(() => mailer.sendMail({
+            from: process.env.SMTP_FROM,
+            to: user.email,
+            subject: 'Reset your Campus Exchange password',
+            text: `A password reset was requested for your Campus Exchange account. Open this link within ${PASSWORD_RESET_TOKEN_TTL_MINUTES} minutes to choose a new password: ${resetUrl.toString()}\n\nIf you did not request this, ignore this email. Your password will not change.`,
+            html: `<p>A password reset was requested for your Campus Exchange account.</p><p><a href="${resetUrl.toString()}">Choose a new password</a></p><p>This link expires in ${PASSWORD_RESET_TOKEN_TTL_MINUTES} minutes and can only be used once.</p><p>If you did not request this, ignore this email. Your password will not change.</p>`,
+          })).catch(() => {
+          console.error('Password reset email delivery failed; reset token invalidation queued.');
+          pool.query(
+            `UPDATE password_reset_tokens SET consumed_at = NOW()
+             WHERE token_hash = $1 AND consumed_at IS NULL`,
+            [hashResetValue(token)],
+          ).catch(() => console.error('Unable to invalidate undelivered password reset token.'));
+        });
+      });
+    }
+    return res.status(202).json({ message: passwordResetMessage });
+  } catch (error) {
+    console.error('Password reset request failed.');
+    return res.status(503).json({ error: 'Password reset is temporarily unavailable. Please try again later.' });
+  }
+});
+
+app.post('/api/auth/password-reset/complete', async (req, res) => {
+  if (!pool || !JWT_SECRET) {
+    return res.status(503).json({ error: 'Password reset is temporarily unavailable. Please try again later.' });
+  }
+  const { token, password } = req.body || {};
+  if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)
+      || typeof password !== 'string' || password.length < 8 || password.length > 128) {
+    return res.status(400).json({ error: 'The reset link or new password is invalid.' });
+  }
+  const ipKey = hashResetRateKey(String(req.ip || 'unknown'));
+  const rateClient = await pool.connect();
+  try {
+    await rateClient.query('BEGIN');
+    await rateClient.query('SELECT pg_advisory_xact_lock(hashtext($1))', [ipKey]);
+    const recentAttempts = await rateClient.query(
+      `SELECT COUNT(*)::int AS attempts FROM password_reset_attempts
+       WHERE ip_key = $1 AND created_at >= NOW() - INTERVAL '1 hour'`,
+      [ipKey],
+    );
+    await rateClient.query('INSERT INTO password_reset_attempts (ip_key) VALUES ($1)', [ipKey]);
+    if (recentAttempts.rows[0].attempts >= PASSWORD_RESET_COMPLETIONS_PER_IP_HOUR) {
+      await rateClient.query('COMMIT');
+      return res.status(429).json({ error: 'Too many reset attempts. Request a new link later.' });
+    }
+    await rateClient.query('COMMIT');
+  } catch (error) {
+    await rateClient.query('ROLLBACK');
+    console.error('Password reset rate check failed.');
+    return res.status(503).json({ error: 'Password reset is temporarily unavailable. Please try again later.' });
+  } finally {
+    rateClient.release();
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const tokenResult = await client.query(
+      `SELECT id, user_id FROM password_reset_tokens
+       WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > NOW()
+       FOR UPDATE`,
+      [hashResetValue(token)],
+    );
+    if (!tokenResult.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This reset link is invalid, expired, or already used. Request a new link.' });
+    }
+    const passwordHash = await bcrypt.hash(password, 12);
+    await client.query(
+      `UPDATE users SET password_hash = $1, password_version = password_version + 1
+       WHERE id = $2`,
+      [passwordHash, tokenResult.rows[0].user_id],
+    );
+    await client.query(
+      `UPDATE password_reset_tokens SET consumed_at = NOW()
+       WHERE user_id = $1 AND consumed_at IS NULL`,
+      [tokenResult.rows[0].user_id],
+    );
+    const userResult = await client.query('SELECT email FROM users WHERE id = $1', [tokenResult.rows[0].user_id]);
+    await client.query(
+      `DELETE FROM login_attempts WHERE right(attempt_key, length($1)) = $1`,
+      [userResult.rows[0].email],
+    );
+    await client.query('COMMIT');
+    return res.json({ message: 'Password updated. Sign in with your new password.' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Password reset completion failed.');
+    return res.status(500).json({ error: 'Unable to update the password. Request a new reset link and try again.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -212,10 +469,56 @@ const validateListing = (listing) => {
   return null;
 };
 
+app.get('/api/listing-payment-instructions', authenticate, (req, res) => {
+  if (!requireConfiguration(res)) return;
+  const instructions = getPaymentInstructions();
+  if (!instructions) {
+    return res.status(503).json({ error: 'Listing payment instructions are not configured yet. Please contact the marketplace administrator.' });
+  }
+  return res.json({ instructions });
+});
+
+app.get('/api/public/listings', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Listing storage is not configured.' });
+  try {
+    const result = await pool.query(
+      `SELECT id, title, course_code AS "courseCode", price::text, condition, campus,
+              image_url AS "imageUrl", category, is_trade AS "isTrade",
+              trade_request AS "tradeRequest", created_at AS "createdAt"
+       FROM listings WHERE status = 'ACTIVE' AND (expires_at IS NULL OR expires_at > NOW())
+       ORDER BY created_at DESC LIMIT 6`,
+    );
+    return res.json({ listings: result.rows });
+  } catch (error) {
+    console.error('Public listing preview failed:', error);
+    return res.status(500).json({ error: 'Unable to load approved listings.' });
+  }
+});
+
 app.get('/api/listings', authenticate, async (req, res) => {
   if (!requireConfiguration(res)) return;
+  for (const key of ['minPrice', 'maxPrice']) {
+    if (req.query[key] !== undefined
+        && (!/^\d+(\.\d{1,2})?$/.test(String(req.query[key]))
+          || !Number.isFinite(Number(req.query[key]))
+          || Number(req.query[key]) > 100000)) {
+      return res.status(400).json({ error: `${key} must be a valid Rand amount.` });
+    }
+  }
+  if (req.query.minPrice !== undefined && req.query.maxPrice !== undefined
+      && Number(req.query.minPrice) > Number(req.query.maxPrice)) {
+    return res.status(400).json({ error: 'Minimum price cannot be greater than maximum price.' });
+  }
   const values = [];
-  const filters = ["status = 'ACTIVE'"];
+  const filters = ["status = 'ACTIVE'", "(expires_at IS NULL OR expires_at > NOW())"];
+  if (req.query.q) {
+    values.push(`%${String(req.query.q).trim().slice(0, 100)}%`);
+    filters.push(`(title ILIKE $${values.length} OR course_code ILIKE $${values.length} OR description ILIKE $${values.length})`);
+  }
+  if (req.query.category) {
+    values.push(String(req.query.category).trim());
+    filters.push(`category = $${values.length}`);
+  }
   if (req.query.courseCode) {
     values.push(String(req.query.courseCode).trim().toUpperCase());
     filters.push(`course_code = $${values.length}`);
@@ -228,11 +531,28 @@ app.get('/api/listings', authenticate, async (req, res) => {
     values.push(String(req.query.condition).trim());
     filters.push(`condition = $${values.length}`);
   }
+  if (req.query.isTrade === 'true' || req.query.isTrade === 'false') {
+    values.push(req.query.isTrade === 'true');
+    filters.push(`is_trade = $${values.length}`);
+  }
+  if (req.query.minPrice !== undefined && /^\d+(\.\d{1,2})?$/.test(String(req.query.minPrice))) {
+    values.push(Number(req.query.minPrice));
+    filters.push(`price >= $${values.length}`);
+  }
+  if (req.query.maxPrice !== undefined && /^\d+(\.\d{1,2})?$/.test(String(req.query.maxPrice))) {
+    values.push(Number(req.query.maxPrice));
+    filters.push(`price <= $${values.length}`);
+  }
+  const orderBy = {
+    newest: 'created_at DESC',
+    price_asc: 'price ASC NULLS LAST',
+    price_desc: 'price DESC NULLS LAST',
+  }[String(req.query.sort || 'newest')] || 'created_at DESC';
   try {
     const result = await pool.query(
       `SELECT id, title, course_code AS "courseCode", price::text, condition, description, campus,
               image_url AS "imageUrl", status, created_at AS "createdAt", user_id AS "userId", category, is_trade AS "isTrade", trade_request AS "tradeRequest"
-       FROM listings WHERE ${filters.join(' AND ')} ORDER BY created_at DESC`,
+       FROM listings WHERE ${filters.join(' AND ')} ORDER BY ${orderBy}`,
       values,
     );
     return res.json({ listings: result.rows });
@@ -244,11 +564,12 @@ app.get('/api/listings', authenticate, async (req, res) => {
 
 app.get('/api/listings/:id/contact', authenticate, async (req, res) => {
   if (!requireConfiguration(res)) return;
+  if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Listing ID is invalid.' });
   try {
     const result = await pool.query(
       `SELECT u.email, u.phone, u.contact_display_consent
        FROM listings l JOIN users u ON u.id = l.user_id
-       WHERE l.id = $1`,
+       WHERE l.id = $1 AND l.status = 'ACTIVE' AND (l.expires_at IS NULL OR l.expires_at > NOW())`,
       [req.params.id],
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Listing not found.' });
@@ -256,6 +577,11 @@ app.get('/api/listings/:id/contact', authenticate, async (req, res) => {
     if (!contact.contact_display_consent) {
       return res.status(403).json({ error: 'Seller has disabled contact display.' });
     }
+    await pool.query(
+      `INSERT INTO listing_review_events (listing_id, actor_id, event_type, decision)
+       VALUES ($1, $2, 'CONTACT_REVEAL', 'REVEALED')`,
+      [req.params.id, req.user.sub],
+    );
     return res.json({ contact });
   } catch (error) {
     console.error('Contact reveal failed:', error);
@@ -266,23 +592,18 @@ app.get('/api/listings/:id/contact', authenticate, async (req, res) => {
 app.get('/api/listings/:id', authenticate, async (req, res) => {
 
   if (!requireConfiguration(res)) return;
+  if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Listing ID is invalid.' });
   try {
     const result = await pool.query(
       `SELECT l.id, l.title, l.course_code AS "courseCode", l.price::text, l.condition, l.description,
               l.campus, l.image_url AS "imageUrl", l.status, l.created_at AS "createdAt",
-              u.id AS "userId", u.email AS "sellerEmail", u.phone AS "sellerPhone",
-              u.contact_display_consent AS "contactDisplayConsent", l.category, l.is_trade AS "isTrade", l.trade_request AS "tradeRequest"
-       FROM listings l JOIN users u ON u.id = l.user_id WHERE l.id = $1`,
+              l.category, l.is_trade AS "isTrade", l.trade_request AS "tradeRequest"
+       FROM listings l
+       WHERE l.id = $1 AND l.status = 'ACTIVE' AND (l.expires_at IS NULL OR l.expires_at > NOW())`,
       [req.params.id],
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Listing not found.' });
-
-    const listing = result.rows[0];
-    // Mask contact details for the general details page
-    listing.sellerEmail = listing.sellerEmail.replace(/(?<=.{2}).(?=[^@]*?@)/g, "*");
-    listing.sellerPhone = listing.sellerPhone ? listing.sellerPhone.replace(/\d(?=\d{4})/g, "*") : null;
-
-    return res.json({ listing });
+    return res.json({ listing: result.rows[0] });
   } catch (error) {
     console.error('Listing lookup failed:', error);
     return res.status(500).json({ error: 'Unable to load the listing.' });
@@ -293,25 +614,54 @@ app.get('/api/my-listings', authenticate, async (req, res) => {
   if (!requireConfiguration(res)) return;
   const result = await pool.query(
     `SELECT id, title, course_code AS "courseCode", price::text, condition, description, campus,
-            image_url AS "imageUrl", status, created_at AS "createdAt", category, is_trade AS "isTrade", trade_request AS "tradeRequest"
+            image_url AS "imageUrl",
+            CASE WHEN status = 'ACTIVE' AND expires_at <= NOW() THEN 'EXPIRED' ELSE status END AS status,
+            created_at AS "createdAt", category, is_trade AS "isTrade", trade_request AS "tradeRequest",
+            payment_status AS "paymentStatus", moderation_status AS "moderationStatus",
+            payment_review_reason AS "paymentReviewReason", moderation_review_reason AS "moderationReviewReason",
+            expires_at AS "expiresAt"
      FROM listings WHERE user_id = $1 ORDER BY created_at DESC`,
     [req.user.sub],
   );
   return res.json({ listings: result.rows });
 });
 
+app.get('/api/my-listings/:id', authenticate, async (req, res) => {
+  if (!requireConfiguration(res)) return;
+  if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Listing ID is invalid.' });
+  const result = await pool.query(
+    `SELECT id, title, course_code AS "courseCode", price::text, condition, description, campus,
+            image_url AS "imageUrl",
+            CASE WHEN status = 'ACTIVE' AND expires_at <= NOW() THEN 'EXPIRED' ELSE status END AS status,
+            created_at AS "createdAt", category, is_trade AS "isTrade", trade_request AS "tradeRequest",
+            payment_status AS "paymentStatus", moderation_status AS "moderationStatus",
+            payment_review_reason AS "paymentReviewReason", moderation_review_reason AS "moderationReviewReason",
+            expires_at AS "expiresAt"
+     FROM listings WHERE id = $1 AND user_id = $2`,
+    [req.params.id, req.user.sub],
+  );
+  if (!result.rows[0]) return res.status(404).json({ error: 'Listing not found.' });
+  return res.json({ listing: result.rows[0] });
+});
+
 app.post('/api/listings', authenticate, async (req, res) => {
   if (!requireConfiguration(res)) return;
+  if (req.body?.policyAccepted !== true || req.body?.policyVersion !== LISTING_POLICY_VERSION) {
+    return res.status(400).json({ error: 'Please accept the current marketplace rules before submitting.' });
+  }
   const listing = normalizeListing(req.body);
   const validationError = validateListing(listing);
   if (validationError) return res.status(400).json({ error: validationError });
   try {
     const result = await pool.query(
-      `INSERT INTO listings (user_id, title, course_code, price, condition, description, campus, image_url, category, is_trade, trade_request)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      `INSERT INTO listings
+        (user_id, title, course_code, price, condition, description, campus, image_url, category, is_trade, trade_request,
+         status, payment_status, moderation_status, policy_version, policy_acknowledged_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'PENDING_PAYMENT', 'DUE', 'PENDING', $12, NOW())
        RETURNING id, title, course_code AS "courseCode", price::text, condition, description, campus,
-               image_url AS "imageUrl", status, created_at AS "createdAt", category, is_trade AS "isTrade", trade_request AS "tradeRequest"`,
-      [req.user.sub, listing.title, listing.courseCode, listing.price, listing.condition, listing.description, listing.campus, listing.imageUrl, listing.category, listing.isTrade, listing.tradeRequest],
+               image_url AS "imageUrl", status, created_at AS "createdAt", category, is_trade AS "isTrade", trade_request AS "tradeRequest",
+               payment_status AS "paymentStatus", moderation_status AS "moderationStatus"`,
+      [req.user.sub, listing.title, listing.courseCode, listing.price, listing.condition, listing.description, listing.campus, listing.imageUrl, listing.category, listing.isTrade, listing.tradeRequest, LISTING_POLICY_VERSION],
     );
     return res.status(201).json({ listing: result.rows[0] });
   } catch (error) {
@@ -320,18 +670,111 @@ app.post('/api/listings', authenticate, async (req, res) => {
   }
 });
 
+app.post('/api/listings/:id/payment-proof', authenticate, async (req, res) => {
+  if (!requireConfiguration(res)) return;
+  if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Listing ID is invalid.' });
+  const instructions = getPaymentInstructions();
+  if (!instructions) {
+    return res.status(503).json({ error: 'Listing payment instructions are not configured yet. Please contact the marketplace administrator.' });
+  }
+  const proof = getPaymentProofFile(req.body?.dataUrl);
+  if (!proof) return res.status(400).json({ error: 'Upload a valid JPEG, PNG, or PDF proof of payment up to 5MB.' });
+  const fileName = String(req.body?.fileName || 'payment-proof')
+    .replace(/[^\w.-]/g, '_')
+    .slice(0, 120);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const updated = await client.query(
+      `UPDATE listings SET status = 'PENDING_PAYMENT_REVIEW', payment_status = 'SUBMITTED',
+         payment_review_reason = NULL, updated_at = NOW()
+       WHERE id = $1 AND user_id = $2 AND status = 'PENDING_PAYMENT'
+         AND payment_status IN ('DUE', 'REJECTED')
+       RETURNING id`,
+      [req.params.id, req.user.sub],
+    );
+    if (!updated.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Pending listing not found or payment proof is already under review.' });
+    }
+    await client.query(
+      `INSERT INTO listing_payment_proofs (listing_id, uploaded_by, mime_type, original_file_name, proof_data)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [req.params.id, req.user.sub, proof.mimeType, fileName, proof.data],
+    );
+    await client.query(
+      `INSERT INTO listing_review_events (listing_id, actor_id, event_type, decision, reason)
+       VALUES ($1, $2, 'PAYMENT_PROOF_SUBMITTED', 'SUBMITTED', NULL)`,
+      [req.params.id, req.user.sub],
+    );
+    await client.query('COMMIT');
+    return res.status(201).json({ status: 'PENDING_PAYMENT_REVIEW' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Payment proof submission failed:', error);
+    return res.status(500).json({ error: 'Unable to submit payment proof.' });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/listings/:id/renew', authenticate, async (req, res) => {
+  if (!requireConfiguration(res)) return;
+  if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Listing ID is invalid.' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `UPDATE listings
+       SET status = 'PENDING_PAYMENT', payment_status = 'DUE', moderation_status = 'PENDING',
+           payment_review_reason = NULL, moderation_review_reason = NULL, expires_at = NULL, updated_at = NOW()
+       WHERE id = $1 AND user_id = $2 AND
+         (status = 'EXPIRED' OR (status = 'ACTIVE' AND expires_at IS NOT NULL AND expires_at <= NOW()))
+       RETURNING id, status, payment_status AS "paymentStatus"`,
+      [req.params.id, req.user.sub],
+    );
+    if (!result.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Only expired listings can be renewed.' });
+    }
+    await client.query(
+      `INSERT INTO listing_review_events (listing_id, actor_id, event_type, decision)
+       VALUES ($1, $2, 'RENEWAL_STARTED', 'PAYMENT_REQUIRED')`,
+      [req.params.id, req.user.sub],
+    );
+    await client.query('COMMIT');
+    return res.json({ listing: result.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Listing renewal failed:', error);
+    return res.status(500).json({ error: 'Unable to start listing renewal.' });
+  } finally {
+    client.release();
+  }
+});
+
 app.patch('/api/listings/:id', authenticate, async (req, res) => {
   if (!requireConfiguration(res)) return;
+  if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Listing ID is invalid.' });
+  if (req.body?.policyAccepted !== true || req.body?.policyVersion !== LISTING_POLICY_VERSION) {
+    return res.status(400).json({ error: 'Please accept the current marketplace rules before submitting changes.' });
+  }
   const listing = normalizeListing(req.body);
   const validationError = validateListing(listing);
   if (validationError) return res.status(400).json({ error: validationError });
   const result = await pool.query(
     `UPDATE listings SET title = $1, course_code = $2, price = $3, condition = $4,
-      description = $5, campus = $6, image_url = $7, updated_at = NOW()
-     WHERE id = $8 AND user_id = $9 AND status <> 'SOLD'
+      description = $5, campus = $6, image_url = $7, category = $8, is_trade = $9,
+      trade_request = $10, status = CASE WHEN payment_status = 'VERIFIED' THEN 'PENDING_CONTENT_REVIEW' ELSE 'PENDING_PAYMENT' END,
+      moderation_status = 'PENDING', moderation_review_reason = NULL,
+      policy_version = $11, policy_acknowledged_at = NOW(), updated_at = NOW()
+     WHERE id = $12 AND user_id = $13
+       AND status NOT IN ('SOLD', 'WITHDRAWN', 'PENDING_PAYMENT_REVIEW')
      RETURNING id, title, course_code AS "courseCode", price::text, condition, description, campus,
-               image_url AS "imageUrl", status, created_at AS "createdAt"`,
-    [listing.title, listing.courseCode, listing.price, listing.condition, listing.description, listing.campus, listing.imageUrl, req.params.id, req.user.sub],
+               image_url AS "imageUrl", status, created_at AS "createdAt", category,
+               is_trade AS "isTrade", trade_request AS "tradeRequest",
+               payment_status AS "paymentStatus", moderation_status AS "moderationStatus"`,
+    [listing.title, listing.courseCode, listing.price, listing.condition, listing.description, listing.campus, listing.imageUrl, listing.category, listing.isTrade, listing.tradeRequest, LISTING_POLICY_VERSION, req.params.id, req.user.sub],
   );
   if (!result.rows[0]) return res.status(404).json({ error: 'Listing not found or not editable.' });
   return res.json({ listing: result.rows[0] });
@@ -339,14 +782,149 @@ app.patch('/api/listings/:id', authenticate, async (req, res) => {
 
 app.post('/api/listings/:id/sold', authenticate, async (req, res) => {
   if (!requireConfiguration(res)) return;
+  if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Listing ID is invalid.' });
   const result = await pool.query(
     `UPDATE listings SET status = 'SOLD', updated_at = NOW()
-     WHERE id = $1 AND user_id = $2 AND status = 'ACTIVE'
+     WHERE id = $1 AND user_id = $2 AND status = 'ACTIVE' AND (expires_at IS NULL OR expires_at > NOW())
      RETURNING id, status`,
     [req.params.id, req.user.sub],
   );
   if (!result.rows[0]) return res.status(404).json({ error: 'Listing not found or already marked as sold.' });
   return res.json({ listing: result.rows[0] });
+});
+
+app.get('/api/admin/listings/review-queue', authenticate, requireAdmin, async (req, res) => {
+  if (!requireConfiguration(res)) return;
+  try {
+    const result = await pool.query(
+      `SELECT l.id, l.title, l.course_code AS "courseCode", l.price::text, l.condition,
+              l.description, l.campus, l.image_url AS "imageUrl", l.category,
+              l.is_trade AS "isTrade", l.trade_request AS "tradeRequest", l.status,
+              l.payment_status AS "paymentStatus", l.moderation_status AS "moderationStatus",
+              l.created_at AS "createdAt", u.email AS "sellerEmail",
+              u.first_name AS "sellerFirstName", u.last_name AS "sellerLastName",
+              proof.created_at AS "proofUploadedAt", proof.original_file_name AS "proofFileName"
+       FROM listings l JOIN users u ON u.id = l.user_id
+       LEFT JOIN LATERAL (
+         SELECT created_at, original_file_name FROM listing_payment_proofs
+         WHERE listing_id = l.id ORDER BY created_at DESC LIMIT 1
+       ) proof ON TRUE
+       WHERE l.payment_status = 'SUBMITTED'
+          OR (l.payment_status = 'VERIFIED' AND l.moderation_status = 'PENDING'
+              AND l.status = 'PENDING_CONTENT_REVIEW')
+       ORDER BY l.updated_at ASC`,
+    );
+    return res.json({ listings: result.rows });
+  } catch (error) {
+    console.error('Listing review queue failed:', error);
+    return res.status(500).json({ error: 'Unable to load listing reviews.' });
+  }
+});
+
+app.get('/api/admin/listings/:id/payment-proof', authenticate, requireAdmin, async (req, res) => {
+  if (!requireConfiguration(res)) return;
+  if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Listing ID is invalid.' });
+  try {
+    const result = await pool.query(
+      `SELECT mime_type, original_file_name, proof_data
+       FROM listing_payment_proofs WHERE listing_id = $1
+       ORDER BY created_at DESC LIMIT 1`,
+      [req.params.id],
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Payment proof not found.' });
+    const proof = result.rows[0];
+    res.set({
+      'Content-Type': proof.mime_type,
+      'Content-Disposition': `inline; filename="${proof.original_file_name}"`,
+      'Cache-Control': 'private, no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    return res.send(proof.proof_data);
+  } catch (error) {
+    console.error('Admin payment proof retrieval failed:', error);
+    return res.status(500).json({ error: 'Unable to retrieve payment proof.' });
+  }
+});
+
+app.post('/api/admin/listings/:id/payment-review', authenticate, requireAdmin, async (req, res) => {
+  if (!requireConfiguration(res)) return;
+  if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Listing ID is invalid.' });
+  const { decision, reason } = req.body || {};
+  if (!['VERIFIED', 'REJECTED'].includes(decision) || (decision === 'REJECTED' && !String(reason || '').trim())) {
+    return res.status(400).json({ error: 'Choose payment verification or provide a rejection reason.' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const status = decision === 'VERIFIED' ? 'PENDING_CONTENT_REVIEW' : 'PENDING_PAYMENT';
+    const updated = await client.query(
+      `UPDATE listings SET payment_status = $1, status = $2, payment_review_reason = $3, updated_at = NOW()
+       WHERE id = $4 AND payment_status = 'SUBMITTED'
+       RETURNING id`,
+      [decision, status, decision === 'REJECTED' ? String(reason).trim().slice(0, 1000) : null, req.params.id],
+    );
+    if (!updated.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Payment proof is no longer awaiting review.' });
+    }
+    await client.query(
+      `INSERT INTO listing_review_events (listing_id, actor_id, event_type, decision, reason)
+       VALUES ($1, $2, 'PAYMENT_REVIEW', $3, $4)`,
+      [req.params.id, req.user.sub, decision, decision === 'REJECTED' ? String(reason).trim().slice(0, 1000) : null],
+    );
+    await client.query('COMMIT');
+    return res.json({ status });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Payment review failed:', error);
+    return res.status(500).json({ error: 'Unable to record payment review.' });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/admin/listings/:id/moderation-review', authenticate, requireAdmin, async (req, res) => {
+  if (!requireConfiguration(res)) return;
+  if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Listing ID is invalid.' });
+  const { decision, reason, checklist } = req.body || {};
+  if (!['APPROVED', 'REJECTED'].includes(decision) || (decision === 'REJECTED' && !String(reason || '').trim())) {
+    return res.status(400).json({ error: 'Choose listing approval or provide a rejection reason.' });
+  }
+  if (decision === 'APPROVED' && (!Array.isArray(checklist) || checklist.length !== LISTING_REVIEW_CHECKLIST_ITEMS || checklist.some((item) => item !== true))) {
+    return res.status(400).json({ error: 'Complete the policy review checklist before approving this listing.' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const updated = await client.query(
+      `UPDATE listings SET moderation_status = $1,
+         moderation_review_reason = $2,
+         status = CASE WHEN $1 = 'APPROVED' THEN 'ACTIVE' ELSE 'REJECTED' END,
+         expires_at = CASE WHEN $1 = 'APPROVED' THEN COALESCE(expires_at, NOW() + INTERVAL '30 days') ELSE expires_at END,
+         updated_at = NOW()
+       WHERE id = $3 AND payment_status = 'VERIFIED'
+         AND moderation_status = 'PENDING' AND status = 'PENDING_CONTENT_REVIEW'
+       RETURNING id`,
+      [decision, decision === 'REJECTED' ? String(reason).trim().slice(0, 1000) : null, req.params.id],
+    );
+    if (!updated.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Listing is not awaiting content review or its payment is unverified.' });
+    }
+    await client.query(
+      `INSERT INTO listing_review_events (listing_id, actor_id, event_type, decision, reason, checklist)
+       VALUES ($1, $2, 'CONTENT_REVIEW', $3, $4, $5)`,
+      [req.params.id, req.user.sub, decision, decision === 'REJECTED' ? String(reason).trim().slice(0, 1000) : null, JSON.stringify(checklist || [])],
+    );
+    await client.query('COMMIT');
+    return res.json({ status: decision === 'APPROVED' ? 'ACTIVE' : 'REJECTED' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Listing moderation failed:', error);
+    return res.status(500).json({ error: 'Unable to record listing review.' });
+  } finally {
+    client.release();
+  }
 });
 
 app.post('/api/analytics/visits', async (req, res) => {
@@ -372,9 +950,6 @@ app.post('/api/reports', async (req, res) => {
   }
   try {
     const reporterId = req.user ? req.user.sub : null;
-    if (category === 'Scam') {
-      console.log(`[SECURITY ALERT] Scam report filed for listing ${listingId || 'N/A'} by ${reporterEmail || 'Anonymous'}`);
-    }
     await pool.query(
       `INSERT INTO reports (reporter_id, reporter_email, listing_id, user_id, category, description)
        VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -428,13 +1003,16 @@ app.post('/api/exchanges', authenticate, async (req, res) => {
   if (!listingId || !offeredBookTitle || !offeredBookCourse) {
     return res.status(400).json({ error: 'Listing ID, offered book title, and course are required.' });
   }
+  if (!isValidListingId(listingId)) return res.status(400).json({ error: 'Listing ID is invalid.' });
   try {
     const result = await pool.query(
       `INSERT INTO exchanges (requester_id, listing_id, offered_book_title, offered_book_course, condition_preference, notes)
-       VALUES ($1, $2, $3, $4, $5, $6)
+       SELECT $1, l.id, $3, $4, $5, $6 FROM listings l
+       WHERE l.id = $2 AND l.status = 'ACTIVE' AND (l.expires_at IS NULL OR l.expires_at > NOW())
        RETURNING id`,
       [req.user.sub, listingId, offeredBookTitle, offeredBookCourse, conditionPreference, notes],
     );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Approved active listing not found.' });
     return res.status(201).json({ exchangeId: result.rows[0].id });
   } catch (error) {
     console.error('Exchange request failed:', error);
@@ -442,22 +1020,76 @@ app.post('/api/exchanges', authenticate, async (req, res) => {
   }
 });
 
-app.get('/api/reports', authenticate, requireAdmin, async (req, res) => {
+app.get(['/api/reports', '/api/admin/reports'], authenticate, requireAdmin, async (req, res) => {
 
   if (!requireConfiguration(res)) return;
+  const allowedStatuses = new Set(['ALL', 'OPEN', 'REVIEWED', 'RESOLVED']);
+  const status = String(req.query.status || 'ALL').toUpperCase();
+  if (!allowedStatuses.has(status)) return res.status(400).json({ error: 'Choose a valid report status filter.' });
   try {
+    const values = [];
+    const filter = status === 'ALL' ? '' : `WHERE r.status = $${values.push(status)}`;
     const result = await pool.query(
-      `SELECT r.*, u.email AS reporter_email, l.title AS listing_title, us.email AS reported_user_email
+      `SELECT r.id, r.reporter_id AS "reporterId", r.reporter_email AS "reporterEmail",
+              r.listing_id AS "listingId", r.user_id AS "reportedUserId",
+              r.category, r.description, r.status, r.created_at AS "createdAt",
+              u.first_name AS "reporterFirstName", u.last_name AS "reporterLastName",
+              l.title AS "listingTitle", us.email AS "reportedUserEmail",
+              us.first_name AS "reportedFirstName", us.last_name AS "reportedLastName"
        FROM reports r
        LEFT JOIN users u ON u.id = r.reporter_id
        LEFT JOIN listings l ON l.id = r.listing_id
        LEFT JOIN users us ON us.id = r.user_id
+       ${filter}
        ORDER BY r.created_at DESC`,
+      values,
     );
     return res.json({ reports: result.rows });
   } catch (error) {
     console.error('Reports retrieval failed:', error);
     return res.status(500).json({ error: 'Unable to load reports.' });
+  }
+});
+
+app.patch('/api/admin/reports/:id', authenticate, requireAdmin, async (req, res) => {
+  if (!requireConfiguration(res)) return;
+  if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Report ID is invalid.' });
+  const { status, note } = req.body || {};
+  if (!['REVIEWED', 'RESOLVED'].includes(status)) {
+    return res.status(400).json({ error: 'Report status must be REVIEWED or RESOLVED.' });
+  }
+  if (note !== undefined && (typeof note !== 'string' || note.trim().length > 1000)) {
+    return res.status(400).json({ error: 'Internal note must be 1000 characters or fewer.' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const current = await client.query('SELECT status FROM reports WHERE id = $1 FOR UPDATE', [req.params.id]);
+    if (!current.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Report not found.' });
+    }
+    const oldStatus = current.rows[0].status;
+    const allowedTransition = (oldStatus === 'OPEN' && ['REVIEWED', 'RESOLVED'].includes(status))
+      || (oldStatus === 'REVIEWED' && status === 'RESOLVED');
+    if (!allowedTransition) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: `A report cannot move from ${oldStatus} to ${status}.` });
+    }
+    await client.query('UPDATE reports SET status = $1 WHERE id = $2', [status, req.params.id]);
+    await client.query(
+      `INSERT INTO report_review_events (report_id, admin_id, old_status, new_status, internal_note)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [req.params.id, req.user.sub, oldStatus, status, note?.trim() || null],
+    );
+    await client.query('COMMIT');
+    return res.json({ id: req.params.id, status });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Admin report update failed:', error);
+    return res.status(500).json({ error: 'Unable to update report status.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -475,6 +1107,104 @@ app.get('/api/analytics/summary', authenticate, requireAdmin, async (req, res) =
   } catch (error) {
     console.error('Analytics query failed:', error);
     return res.status(500).json({ error: 'Unable to load analytics.' });
+  }
+});
+
+app.get('/api/admin/overview', authenticate, requireAdmin, async (req, res) => {
+  if (!requireConfiguration(res)) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    const [users, listings, reports, fees, visitors] = await Promise.all([
+      client.query(
+        `SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days')::int AS registered_last_30_days
+         FROM users`,
+      ),
+      client.query(
+        `SELECT COUNT(*) FILTER (WHERE status = 'ACTIVE' AND (expires_at IS NULL OR expires_at > NOW()))::int AS active,
+                COUNT(*) FILTER (WHERE status IN ('PENDING_PAYMENT', 'PENDING_PAYMENT_REVIEW'))::int AS pending_payment,
+                COUNT(*) FILTER (WHERE status = 'PENDING_CONTENT_REVIEW')::int AS pending_content_review,
+                COUNT(*) FILTER (WHERE status = 'REJECTED')::int AS rejected,
+                COUNT(*) FILTER (WHERE status = 'SOLD')::int AS sold,
+                COUNT(*) FILTER (WHERE status = 'EXPIRED' OR (status = 'ACTIVE' AND expires_at <= NOW()))::int AS expired
+         FROM listings`,
+      ),
+      client.query(
+        `SELECT COUNT(*) FILTER (WHERE status = 'OPEN')::int AS open,
+                COUNT(*) FILTER (WHERE status = 'REVIEWED')::int AS reviewed,
+                COUNT(*) FILTER (WHERE status = 'RESOLVED')::int AS resolved
+         FROM reports`,
+      ),
+      client.query(
+        `SELECT COUNT(*) FILTER (WHERE payment_status = 'VERIFIED')::int AS verified_periods,
+                COUNT(*) FILTER (WHERE payment_status = 'VERIFIED' AND status = 'ACTIVE'
+                  AND (expires_at IS NULL OR expires_at > NOW()))::int AS active_periods,
+                COUNT(*) FILTER (WHERE payment_status = 'SUBMITTED')::int AS pending_proofs,
+                COUNT(*) FILTER (WHERE payment_status = 'REJECTED')::int AS rejected_proofs,
+                (COUNT(*) FILTER (WHERE payment_status = 'VERIFIED') * 5)::numeric(12,2)::text AS verified_listing_fees_zar
+         FROM listings`,
+      ),
+      client.query(
+        `SELECT COUNT(*)::int AS visits, COUNT(DISTINCT ip_hash)::int AS unique_visitors
+         FROM visitor_events`,
+      ),
+    ]);
+    await client.query('COMMIT');
+    return res.json({
+      users: users.rows[0],
+      listings: listings.rows[0],
+      reports: reports.rows[0],
+      fees: fees.rows[0],
+      visitors: visitors.rows[0],
+      feeTerms: { amountZar: '5.00', periodDays: 30, automaticRenewal: false },
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Admin overview failed:', error);
+    return res.status(500).json({ error: 'Unable to load admin overview.' });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/admin/fee-periods', authenticate, requireAdmin, async (req, res) => {
+  if (!requireConfiguration(res)) return;
+  const allowedStatuses = new Set(['ALL', 'DUE', 'SUBMITTED', 'VERIFIED', 'REJECTED']);
+  const paymentStatus = String(req.query.paymentStatus || 'ALL').toUpperCase();
+  if (!allowedStatuses.has(paymentStatus)) {
+    return res.status(400).json({ error: 'Choose a valid payment status filter.' });
+  }
+  const limit = Math.min(Math.max(Number.parseInt(String(req.query.limit || '50'), 10) || 50, 1), 100);
+  const offset = Math.max(Number.parseInt(String(req.query.offset || '0'), 10) || 0, 0);
+  try {
+    const values = [];
+    let filter = '';
+    if (paymentStatus !== 'ALL') {
+      values.push(paymentStatus);
+      filter = `WHERE l.payment_status = $${values.length}`;
+    }
+    values.push(limit, offset);
+    const result = await pool.query(
+      `SELECT l.id, l.title, l.course_code AS "courseCode", l.status,
+              l.payment_status AS "paymentStatus", l.moderation_status AS "moderationStatus",
+              l.created_at AS "createdAt", l.expires_at AS "expiresAt",
+              CASE WHEN l.status = 'ACTIVE' AND l.expires_at <= NOW() THEN 'EXPIRED' ELSE l.status END AS "effectiveStatus",
+              u.first_name AS "sellerFirstName", u.last_name AS "sellerLastName", u.email AS "sellerEmail",
+              proof.created_at AS "proofUploadedAt"
+       FROM listings l JOIN users u ON u.id = l.user_id
+       LEFT JOIN LATERAL (
+         SELECT created_at FROM listing_payment_proofs
+         WHERE listing_id = l.id ORDER BY created_at DESC LIMIT 1
+       ) proof ON TRUE
+       ${filter}
+       ORDER BY l.created_at DESC LIMIT $${values.length - 1} OFFSET $${values.length}`,
+      values,
+    );
+    return res.json({ periods: result.rows, fee: { amountZar: '5.00', periodDays: 30, automaticRenewal: false } });
+  } catch (error) {
+    console.error('Admin fee-period query failed:', error);
+    return res.status(500).json({ error: 'Unable to load listing fee periods.' });
   }
 });
 
@@ -503,8 +1233,41 @@ const schema = `
     popia_consented_at TIMESTAMPTZ,
     popia_consent_version TEXT,
     role TEXT NOT NULL DEFAULT 'STUDENT' CHECK (role IN ('STUDENT', 'ADMIN')),
+    password_version INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS password_version INTEGER NOT NULL DEFAULT 0;
+  CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS password_reset_tokens_user_idx
+    ON password_reset_tokens (user_id, created_at DESC);
+  CREATE TABLE IF NOT EXISTS password_reset_requests (
+    id BIGSERIAL PRIMARY KEY,
+    email_key TEXT NOT NULL,
+    ip_key TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS password_reset_requests_email_time_idx
+    ON password_reset_requests (email_key, created_at DESC);
+  CREATE INDEX IF NOT EXISTS password_reset_requests_ip_time_idx
+    ON password_reset_requests (ip_key, created_at DESC);
+  CREATE INDEX IF NOT EXISTS password_reset_requests_created_at_idx
+    ON password_reset_requests (created_at);
+  CREATE TABLE IF NOT EXISTS password_reset_attempts (
+    id BIGSERIAL PRIMARY KEY,
+    ip_key TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS password_reset_attempts_ip_time_idx
+    ON password_reset_attempts (ip_key, created_at DESC);
+  CREATE INDEX IF NOT EXISTS password_reset_attempts_created_at_idx
+    ON password_reset_attempts (created_at);
   CREATE TABLE IF NOT EXISTS visitor_events (
     id BIGSERIAL PRIMARY KEY,
     path TEXT NOT NULL,
@@ -529,10 +1292,60 @@ const schema = `
     description TEXT NOT NULL,
     campus TEXT NOT NULL,
     image_url TEXT,
-    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'SOLD')),
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'SOLD', 'PENDING_PAYMENT', 'PENDING_PAYMENT_REVIEW', 'PENDING_CONTENT_REVIEW', 'REJECTED', 'EXPIRED', 'WITHDRAWN')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
+  DO $$
+  BEGIN
+    PERFORM pg_advisory_xact_lock(427162025);
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'listings'::regclass
+        AND conname = 'listings_status_check'
+        AND pg_get_constraintdef(oid) LIKE '%PENDING_PAYMENT%'
+    ) THEN
+      ALTER TABLE listings DROP CONSTRAINT IF EXISTS listings_status_check;
+      ALTER TABLE listings ADD CONSTRAINT listings_status_check
+        CHECK (status IN ('ACTIVE', 'SOLD', 'PENDING_PAYMENT', 'PENDING_PAYMENT_REVIEW', 'PENDING_CONTENT_REVIEW', 'REJECTED', 'EXPIRED', 'WITHDRAWN'));
+    END IF;
+  END $$;
+  ALTER TABLE listings ALTER COLUMN price DROP NOT NULL;
+  ALTER TABLE listings ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'Textbook';
+  ALTER TABLE listings ADD COLUMN IF NOT EXISTS is_trade BOOLEAN NOT NULL DEFAULT FALSE;
+  ALTER TABLE listings ADD COLUMN IF NOT EXISTS trade_request TEXT;
+  ALTER TABLE listings ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'VERIFIED'
+    CHECK (payment_status IN ('DUE', 'SUBMITTED', 'VERIFIED', 'REJECTED'));
+  ALTER TABLE listings ADD COLUMN IF NOT EXISTS moderation_status TEXT NOT NULL DEFAULT 'APPROVED'
+    CHECK (moderation_status IN ('PENDING', 'APPROVED', 'REJECTED'));
+  ALTER TABLE listings ADD COLUMN IF NOT EXISTS payment_review_reason TEXT;
+  ALTER TABLE listings ADD COLUMN IF NOT EXISTS moderation_review_reason TEXT;
+  ALTER TABLE listings ADD COLUMN IF NOT EXISTS policy_version TEXT;
+  ALTER TABLE listings ADD COLUMN IF NOT EXISTS policy_acknowledged_at TIMESTAMPTZ;
+  ALTER TABLE listings ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+  CREATE TABLE IF NOT EXISTS listing_payment_proofs (
+    id BIGSERIAL PRIMARY KEY,
+    listing_id BIGINT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    uploaded_by BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    mime_type TEXT NOT NULL CHECK (mime_type IN ('image/jpeg', 'image/png', 'application/pdf')),
+    original_file_name TEXT NOT NULL,
+    proof_data BYTEA NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS listing_payment_proofs_listing_idx
+    ON listing_payment_proofs (listing_id, created_at DESC);
+  CREATE TABLE IF NOT EXISTS listing_review_events (
+    id BIGSERIAL PRIMARY KEY,
+    listing_id BIGINT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    actor_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    reason TEXT,
+    checklist JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS listing_review_events_listing_idx
+    ON listing_review_events (listing_id, created_at DESC);
   CREATE TABLE IF NOT EXISTS reports (
     id BIGSERIAL PRIMARY KEY,
     reporter_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
@@ -544,6 +1357,17 @@ const schema = `
     status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'REVIEWED', 'RESOLVED')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
+  CREATE TABLE IF NOT EXISTS report_review_events (
+    id BIGSERIAL PRIMARY KEY,
+    report_id BIGINT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+    admin_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    old_status TEXT NOT NULL,
+    new_status TEXT NOT NULL CHECK (new_status IN ('REVIEWED', 'RESOLVED')),
+    internal_note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS report_review_events_report_idx
+    ON report_review_events (report_id, created_at DESC);
   CREATE TABLE IF NOT EXISTS exchanges (
     id BIGSERIAL PRIMARY KEY,
     requester_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -558,6 +1382,16 @@ const schema = `
   CREATE INDEX IF NOT EXISTS exchanges_listing_idx ON exchanges (listing_id);
   CREATE INDEX IF NOT EXISTS exchanges_requester_idx ON exchanges (requester_id);
 `;
+
+app.use((error, req, res, next) => {
+  if (error?.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request is too large. Payment proof files must be 5MB or smaller.' });
+  }
+  if (error instanceof SyntaxError && error.status === 400 && 'body' in error) {
+    return res.status(400).json({ error: 'Request body is invalid JSON.' });
+  }
+  return next(error);
+});
 
 const start = async () => {
   if (pool) await pool.query(schema);
