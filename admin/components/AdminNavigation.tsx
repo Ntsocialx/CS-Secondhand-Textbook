@@ -1,11 +1,12 @@
 import Link from "next/link";
 
 const adminLinks = [
-  { href: "/admin", label: "Overview" },
-  { href: "/admin/listings", label: "Listing reviews" },
-  { href: "/admin/reports", label: "Reports" },
-  { href: "/admin/fees", label: "Fee periods" },
-  { href: "/admin/analytics", label: "Visitor analytics" },
+  { href: "/", label: "Overview" },
+  { href: "/listings", label: "Listing reviews" },
+  { href: "/payments", label: "Payment proofs" },
+  { href: "/reports", label: "Reports" },
+  { href: "/fees", label: "Fee periods" },
+  { href: "/analytics", label: "Visitor analytics" },
 ];
 
 export function AdminNavigation({ active }: { active: string }) {

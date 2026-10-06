@@ -60,6 +60,7 @@ Can:
 - Create and manage personal listings
 - Mark a listing as sold
 - Request an exchange
+- Accept or decline requests for the student's own trade listings
 - Report a listing or user
 
 ### Administrator
@@ -68,7 +69,9 @@ Can:
 
 - Access protected analytics
 - Review visitor metrics
-- Eventually review reports and moderate listings
+- Review private listing payment proof and approve/reject listing content
+- Review reports and transition report status
+- Monitor aggregate fee-period and visitor metrics
 
 Admin capabilities must never be granted by a client-side role check alone. The Express API must enforce authorization.
 
@@ -78,7 +81,7 @@ Admin capabilities must never be granted by a client-side role check alone. The 
 
 - Student registration and login
 - Approved student email validation
-- TUT support, including `student.tut.ac.za` and `tut.ac.za`
+- TUT support, including `student.tut.ac.za`, `tut.ac.za`, and `tut4life.ac.za`
 - POPIA consent capture and versioning
 - Essential/optional cookie choice
 - Failed-login lockout
@@ -88,11 +91,17 @@ Admin capabilities must never be granted by a client-side role check alone. The 
 - Listing browsing and filtering
 - Listing detail page
 - Seller contact reveal
+- Manual listing fee and private payment-proof review
+- Listing policy acknowledgement and pre-publication content moderation
 - Mark listing as sold
 - Exchange request and confirmation
 - Report listing/user flow
 - Campus meetup safety guidance
 - Admin visitor analytics
+- Manual R5-per-listing/30-day fee paid outside the site, with private proof upload
+- Separate admin payment verification and listing content moderation before publication
+- Marketplace policy acknowledgement and report review
+- Student password recovery by email
 - Responsive Figma-style UI
 
 ### Explicitly out of scope
@@ -130,10 +139,11 @@ Do not add these without a separately approved scope change:
 
 ### Current database tables
 
-- `users`
-- `visitor_events`
-- `login_attempts`
-- `listings`
+The Express startup schema currently manages `users`, `visitor_events`, `login_attempts`,
+`listings`, `listing_payment_proofs`, `listing_review_events`, `reports`,
+`report_review_events`, `exchanges`, `exchange_review_events`,
+`password_reset_tokens`, `password_reset_requests`, and `password_reset_attempts`.
+Consent audit history remains a separate requirement.
 
 ### Current data state
 
@@ -147,22 +157,26 @@ The Figma preview catalog remains static in [`client/lib/marketplace.ts`](C:/Use
 - Home page
 - Browse page
 - Book details page
-- Seller contact mockup page
-- Sell/listing form mockup
-- My Listings mockup
-- Exchange request mockup
-- Exchange confirmation mockup
-- Report page mockup
+- Separate seller contact page with explicit API-backed reveal
+- Listing submission, private proof upload, review status, renew and mark-sold flows
+- API-backed My Listings
+- Persisted exchange request and owner decision flow
+- Persisted report submission and admin review
 - Login page
 - Registration page
 - POPIA consent modal
 - Cookie consent banner
-- TUT selector and approved TUT domains
+- TUT registration domain validation (`student.tut.ac.za`, `tut.ac.za`, `tut4life.ac.za`)
 - Protected marketplace routes through [`client/proxy.ts`](C:/Users/student/Desktop/CS-Secondhand-Textbook/client/proxy.ts)
 - Five-failure, five-minute PostgreSQL-backed login lockout
-- API-backed listing creation, browse/search/filter, details, and My Listings
-- Ownership-protected mark-as-sold workflow
-- Admin analytics route and salted visitor IP hashes
+- API-backed listing creation, browse/search/filter, details, My Listings, payment proof,
+  renewal, moderation, and ownership-protected sold workflow
+- Explicit consent-gated seller contact reveal with audit events
+- Authenticated, persistent exchange requests with owner-only accept/decline and status audit
+- Authenticated private reports with token-derived reporter identity and admin review audit
+- Separate protected admin app for overview, analytics, listing review, reports, and fees
+- Secure single-use password reset flow with per-account token version invalidation
+- Salted visitor IP hashes and aggregate admin analytics
 - Local Figma-derived book images
 
 ### Known gaps before MVP completion
@@ -170,18 +184,31 @@ The Figma preview catalog remains static in [`client/lib/marketplace.ts`](C:/Use
 - Image upload currently stores validated base64 data URLs in PostgreSQL; object storage is still required before production scale.
 - Browse currently supports course, campus, and condition filters; subject, price range, and sorting remain future enhancements.
 - Listing edit UI is not yet exposed, although the ownership-protected PATCH endpoint exists.
-- Seller contact reveal is not backed by a protected endpoint.
-- Exchange requests are not stored.
-- Reports are local UI state and are not sent to the API.
-- There is no moderation queue.
-- Reports, exchanges, seller contact reveal, moderation, and consent audit history remain future API work.
+- Contact, exchange, report, and listing-review acceptance flows still require live,
+  role-separated integration verification against an operator-approved test environment.
+- Consent audit history and a versioned migration runner remain future production work.
+- Production deployment, SMTP delivery, bank detail configuration, qualified legal review,
+  and owner acceptance require operator credentials/approval and are not presumed complete.
 - The schema is startup-created with `CREATE TABLE IF NOT EXISTS`; a versioned migration runner is recommended before production.
+
+### Phase handover status
+
+- **Phase 3:** exchange request/owner decision and authenticated report paths are implemented,
+  persisted, and audit-recorded. Pure input tests, client lint/build, and signed-out API
+  authorization checks pass. Database-backed persistence, ownership decisions, and private
+  response checks remain unverified because the configured database host failed DNS lookup.
+- **Phase 4:** admin pages/APIs, documentation, and local build checks are present. Signed-out
+  admin/report/exchange API requests return 401. Signed-in STUDENT-vs-ADMIN checks, database
+  migration verification, production smoke tests, legal review, and owner acceptance remain
+  release gates; no deployment is claimed.
 
 ## 8. Architecture contract
 
-1. Keep the frontend and Express API separate.
-2. Frontend components must call the Express API through shared helpers such as [`client/lib/api.ts`](C:/Users/student/Desktop/CS-Secondhand-Textbook/client/lib/api.ts).
-3. Do not connect Next.js components directly to PostgreSQL.
+1. Keep the student marketplace in `client/`, the separate admin Next.js app in root `admin/`,
+   and the Express API separate.
+2. Marketplace components call APIs through `client/lib/api.ts`; the admin app uses its own
+   server-side proxy and helper in `admin/app/api/backend/` and `admin/lib/api.ts`.
+3. Do not connect either Next.js app directly to PostgreSQL.
 4. Keep the data model intentionally small. Prefer a minimal set of tables over a complex domain model.
 5. Use parameterized SQL for every database query.
 6. Validate and normalize user input at the API boundary.
@@ -294,7 +321,7 @@ Each sprint is expected to produce a demonstrable increment. Sprint length is tw
 **Deliverables**
 
 - Student email validation
-- TUT and other approved university support
+- TUT student email domain validation
 - Password hashing
 - Session creation
 - Helpful validation errors
@@ -404,7 +431,7 @@ Each sprint is expected to produce a demonstrable increment. Sprint length is tw
 
 - Protected contact endpoint
 - Consent-aware response
-- Masked display behavior
+- Clear consent-disabled state
 - Reveal audit event
 
 **Acceptance criteria**
@@ -423,9 +450,9 @@ Each sprint is expected to produce a demonstrable increment. Sprint length is tw
 **Deliverables**
 
 - Exchange request endpoint
-- Requested and offered listing references
+- Requested listing and offered-book title/course details
 - Condition preference
-- Optional seller note
+- Optional requester note
 - Confirmation response
 - Request status
 

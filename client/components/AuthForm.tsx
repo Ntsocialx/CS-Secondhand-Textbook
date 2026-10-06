@@ -75,7 +75,11 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
         }
         throw new Error("Unable to sign in with those details.");
       }
-      router.push("/browse");
+      const requestedPath = new URLSearchParams(window.location.search).get("callbackUrl");
+      const returnPath = requestedPath?.startsWith("/") && !requestedPath.startsWith("//")
+        ? requestedPath
+        : "/browse";
+      router.push(returnPath);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Unable to complete authentication.");
     } finally {

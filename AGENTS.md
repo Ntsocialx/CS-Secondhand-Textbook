@@ -24,13 +24,14 @@ Students list, browse, and exchange secondhand textbooks with other verified stu
 their own campus, arranging safe in-person meetups. This is a marketplace, not a payment,
 delivery, chat, or logistics platform.
 
-In scope: registration with an approved student email domain (`student.tut.ac.za`,
-`tut.ac.za`), POPIA consent + cookie choice, failed-login lockout, protected marketplace
-routes, listing creation + image upload, browsing/filtering, seller contact reveal, mark as
-sold, exchange request/confirmation, report listing/user, meetup safety guidance, admin
-visitor analytics, manual R5-per-listing monthly fee via bank transfer, private proof upload,
-admin payment/content review before publication, marketplace rules, responsive classified
-listings UI, and Gumtree-inspired (not copied) marketplace information architecture.
+In scope: registration with an approved TUT student email domain (`student.tut.ac.za`,
+`tut.ac.za`, `tut4life.ac.za`), POPIA consent + cookie choice, failed-login lockout,
+protected marketplace routes, listing creation + image upload, browsing/filtering, seller
+contact reveal, mark as sold, exchange requests/confirmation and owner decisions, private
+listing/user reports, meetup safety guidance, admin visitor analytics, manual
+R5-per-listing/30-day fee via bank transfer, private proof upload, admin payment/content
+review before publication, marketplace rules, responsive classified listings UI, and
+Gumtree-inspired (not copied) marketplace information architecture.
 
 Out of scope (needs a separately approved scope change): online payments, delivery/shipping/
 tracking, real-time chat or WebSockets, price negotiation workflows, ratings/reviews/seller
@@ -39,16 +40,22 @@ checkout flows, social feeds/follower systems, unnecessary state-management libr
 kits. The listing fee is paid manually outside the site; the portal only accepts private
 proof for admin review.
 
-Do not overbuild. Known gaps: listing pages, sell form, browse filters, My Listings, seller
-contact reveal, exchange requests, and reports are currently UI-only or backed by static mock
-data in `client/lib/marketplace.ts` — treat none of these as complete until backed by the
-Express API and persisted.
+Do not overbuild. Core listing creation, browse/search, listing detail, My Listings,
+contact reveal, sold status, exchange creation/status, and report submission have Express
+API paths and database persistence; retain them as incomplete until their relevant
+authorization, privacy, persistence, and UI acceptance checks pass. Static featured catalog
+content remains in `client/lib/marketplace.ts`; it is sample discovery content, not persisted
+student listings.
 
 ## 3. Architecture
 
-- Keep the Next.js frontend and Express API separate. Frontend components call the API only
-  through shared helpers (`client/lib/api.ts`) — never connect Next.js components directly to
-  PostgreSQL.
+- Keep the Next.js frontend and Express API separate. Marketplace components use
+  `client/lib/api.ts`; the admin app uses its own server-side proxy and helper in
+  `admin/app/api/backend/` and `admin/lib/api.ts`. Never connect Next.js components directly
+  to PostgreSQL.
+- Keep the student marketplace in `client/` and the independent admin Next.js application in
+  the repository-root `admin/` directory. Admin UI changes belong in `admin/`; admin role
+  authorization and private data rules remain enforced by the Express API.
 - Keep the data model intentionally small; prefer a minimal set of tables.
 - Validate and normalize all input at the API boundary. Use parameterized SQL for every query.
 - Enforce authentication and authorization server-side, never only in the UI.
@@ -71,8 +78,8 @@ set.
 
 Tables include `users`, `visitor_events`, `listings`, `reports`, `exchanges`,
 `listing_payment_proofs`, `listing_review_events`, `report_review_events`,
-`password_reset_tokens`, `password_reset_requests`, and `password_reset_attempts`. Consent
-audit history remains a separate requirement.
+`exchange_review_events`, `password_reset_tokens`, `password_reset_requests`, and
+`password_reset_attempts`. Consent audit history remains a separate requirement.
 
 Required before saving:
 - Listing: title, course code, sale price or exchange request, condition, description,
@@ -82,8 +89,8 @@ Required before saving:
   original safe display name, bytes, and timestamp. Proof bytes are never returned in public
   listing APIs.
 - Review event: listing, actor, event type, decision, reason/checklist, and timestamp.
-- Report: category, description, reporter identity (when authenticated), target listing/user,
-  timestamp — reporter must never be exposed publicly.
+- Report: authenticated reporter identity (derived from the access token), category,
+  description, one target listing/user, timestamp — reporter must never be exposed publicly.
 - Consent: version + timestamp recorded at registration/login; contact-display consent is
   separate and optional.
 
@@ -123,7 +130,14 @@ Implemented listing/payment/review routes:
   REVIEWED to RESOLVED, recording an internal audit event.
 - `GET /api/analytics/summary` — `ADMIN` only; aggregate visitor analytics.
 - `POST /api/exchanges` — creates an exchange request only for an approved, active,
-  unexpired listing.
+  unexpired listing offered for trade.
+- `GET /api/my-exchanges` — authenticated requester gets their own requests and listing
+  owners get requests for their listings; no private contact or proof data.
+- `PATCH /api/exchanges/:id` — only the listing owner can accept or decline a pending
+  request while the listing is active and unexpired; status changes are audited.
+- `POST /api/reports` — authenticated; reporter identity is derived from the access token,
+  never the request body. Exactly one listing/user target and an approved category are
+  required; duplicate and high-rate submissions are rejected.
 
 Keep these contracts synchronized with the Express implementation. Other existing APIs
 include auth, analytics, reports, and exchanges.
@@ -151,13 +165,21 @@ Specific rules:
 - Five failed password attempts → five-minute lockout, keyed by normalized email + client IP;
   successful login clears the counter; locked requests return HTTP 429 with `Retry-After`.
   Before production, move this off in-memory state to a shared durable store.
+- Registration is restricted to the TUT email aliases listed in Section 2. Keep frontend and
+  API allowlists synchronized; do not permit placeholder/test domains in production.
+- Report submission requires an authenticated student. Reporter identity is never taken
+  from client fields or returned outside ADMIN-only report review.
+- Exchange requests are private to their requester and listing owner. Only the listing owner
+  can decide a pending request; decisions and automatic pending declines after another offer
+  is accepted or a listing is sold are recorded in `exchange_review_events`.
 - Contact details are returned only after an authenticated, explicit reveal request, and the
   reveal action must be auditable.
 - Admin endpoints must validate the `ADMIN` role server-side — never trust a client-side role
   check. The server checks the user's current database role so revocation takes effect for
   subsequent admin API requests.
-- `/admin` pages require an `ADMIN` session at middleware and page boundaries; private data
-  and actions additionally require server authorization.
+- The separate admin app requires an `ADMIN` session at middleware and page boundaries;
+  its server-side API proxy and Express endpoints additionally enforce authorization.
+  Marketplace `/admin` URLs are compatibility redirects to the admin app.
 - Admin accounts are promoted only by a server-host CLI command for an existing account;
   do not seed shared credentials or place passwords in source control.
 - Password-reset tokens are high-entropy, stored only as hashes, single-use, 30-minute

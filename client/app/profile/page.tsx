@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useSession } from "next-auth/react";
 import { useRouter } from "next/navigation";
@@ -8,6 +7,15 @@ import { Header, Footer } from "@/components/MarketplaceChrome";
 import { fetchJson, withBearer } from "@/lib/api";
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000";
+
+type ProfileUser = {
+  first_name: string | null;
+  last_name: string | null;
+  gender: string | null;
+  phone: string | null;
+  campus: string | null;
+  faculty: string | null;
+};
 
 export default function ProfilePage() {
   const { data: session } = useSession();
@@ -26,7 +34,7 @@ export default function ProfilePage() {
 
   useEffect(() => {
     if (!session?.user.accessToken) return;
-    fetchJson<{ user: any }>(`${apiUrl}/api/users/me`, withBearer(session.user.accessToken))
+    fetchJson<{ user: ProfileUser }>(`${apiUrl}/api/users/me`, withBearer(session.user.accessToken))
       .then((payload) => {
         const u = payload.user;
         setForm({

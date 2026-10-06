@@ -4,9 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useSession } from "next-auth/react";
 import { AdminNavigation } from "@/components/AdminNavigation";
-import { fetchJson, withBearer } from "@/lib/api";
-
-const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000";
+import { fetchJson } from "@/lib/api";
 type ReportStatus = "OPEN" | "REVIEWED" | "RESOLVED";
 type Report = {
   id: string;
@@ -36,29 +34,27 @@ export default function AdminReportsPage() {
   const [busyId, setBusyId] = useState<string | null>(null);
 
   useEffect(() => {
-    const token = session?.user.accessToken;
-    if (sessionStatus !== "authenticated" || session?.user.role !== "ADMIN" || !token) return;
+    if (sessionStatus !== "authenticated" || session?.user.role !== "ADMIN") return;
     let cancelled = false;
-    fetchJson<{ reports: Report[] }>(`${apiUrl}/api/admin/reports?status=${filter}`, withBearer(token))
+    fetchJson<{ reports: Report[] }>(`/api/backend/admin/reports?status=${filter}`)
       .then((result) => { if (!cancelled) { setReports(result.reports); setError(""); } })
       .catch((requestError: unknown) => { if (!cancelled) setError(requestError instanceof Error ? requestError.message : "Unable to load reports."); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [filter, session?.user.accessToken, session?.user.role, sessionStatus]);
+  }, [filter, session?.user.role, sessionStatus]);
 
   async function updateReport(report: Report, nextStatus: Exclude<ReportStatus, "OPEN">) {
-    if (!session?.user.accessToken) return;
     setBusyId(report.id);
     setError("");
     setNotice("");
     try {
-      await fetchJson(`${apiUrl}/api/admin/reports/${report.id}`, withBearer(session.user.accessToken, {
+      await fetchJson(`/api/backend/admin/reports/${report.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status: nextStatus, note: notes[report.id] ?? "" }),
-      }));
+      });
       setNotice(`Report #${report.id} marked ${nextStatus.toLowerCase()}.`);
-      const result = await fetchJson<{ reports: Report[] }>(`${apiUrl}/api/admin/reports?status=${filter}`, withBearer(session.user.accessToken));
+      const result = await fetchJson<{ reports: Report[] }>(`/api/backend/admin/reports?status=${filter}`);
       setReports(result.reports);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Unable to update report.");
@@ -73,8 +69,8 @@ export default function AdminReportsPage() {
   return (
     <main className="min-h-screen bg-[#f7f9fc] px-5 py-8 text-[#142039] sm:px-8">
       <div className="mx-auto max-w-6xl">
-        <header className="mb-6"><Link href="/admin" className="text-xs font-bold text-[#2161ee]">← Admin control center</Link><h1 className="mt-3 text-2xl font-extrabold">Reports</h1><p className="mt-2 text-sm text-[#60728d]">Investigate reports and record status changes. Internal notes are admin-only.</p></header>
-        <AdminNavigation active="/admin/reports" />
+        <header className="mb-6"><Link href="/" className="text-xs font-bold text-[#2161ee]">← Admin control center</Link><h1 className="mt-3 text-2xl font-extrabold">Reports</h1><p className="mt-2 text-sm text-[#60728d]">Investigate reports and record status changes. Internal notes are admin-only.</p></header>
+        <AdminNavigation active="/reports" />
         <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
           <p className="text-xs text-[#718198]">{reports.length} report{reports.length === 1 ? "" : "s"}</p>
           <label className="text-xs font-bold">Filter <select value={filter} onChange={(event) => setFilter(event.target.value)} className="ml-2 rounded-md border border-[#dce4ee] bg-white px-3 py-2"><option value="ALL">All reports</option><option value="OPEN">Open</option><option value="REVIEWED">Reviewed</option><option value="RESOLVED">Resolved</option></select></label>

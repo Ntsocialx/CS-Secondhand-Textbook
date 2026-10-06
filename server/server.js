@@ -5,6 +5,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const rateLimit = require('express-rate-limit');
+const { validateExchangeInput, validateReportInput } = require('./lib/marketplace-validation');
 require('dotenv').config();
 
 const app = express();
@@ -20,7 +22,7 @@ const PASSWORD_RESET_TOKEN_TTL_MINUTES = 30;
 const PASSWORD_RESET_REQUESTS_PER_EMAIL_HOUR = 3;
 const PASSWORD_RESET_REQUESTS_PER_IP_HOUR = 10;
 const PASSWORD_RESET_COMPLETIONS_PER_IP_HOUR = 20;
-const ALLOWED_EMAIL_DOMAINS = ['student.tut.ac.za', 'tut.ac.za', 'tut4life.ac.za', 'student.campus.edu'];
+const ALLOWED_EMAIL_DOMAINS = ['student.tut.ac.za', 'tut.ac.za', 'tut4life.ac.za'];
 const LOGIN_FAILURE_LIMIT = 5;
 const LOGIN_LOCKOUT_MS = 5 * 60 * 1000;
 const pool = process.env.DATABASE_URL
@@ -33,6 +35,18 @@ const pool = process.env.DATABASE_URL
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '8mb' }));
+
+const authRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  handler: (req, res) => {
+    res.set('Retry-After', String(Math.ceil((15 * 60 * 1000) / 1000)));
+    res.status(429).json({ error: 'Too many authentication attempts. Please try again in about 15 minutes.' });
+  },
+});
 
 const requireConfiguration = (res) => {
   if (!pool || !JWT_SECRET) {
@@ -199,7 +213,7 @@ const getPasswordResetBaseUrl = () => {
 
 const passwordResetMessage = 'If an account exists for that email, password reset instructions will be sent shortly.';
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', authRateLimiter, async (req, res) => {
   if (!requireConfiguration(res)) return;
   const { email, password, phone, firstName, lastName, gender, campus, faculty, consent } = req.body || {};
   const normalizedEmail = String(email || '').trim().toLowerCase();
@@ -402,7 +416,7 @@ app.post('/api/auth/password-reset/complete', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authRateLimiter, async (req, res) => {
   if (!requireConfiguration(res)) return;
   const { email, password, consent } = req.body || {};
   const normalizedEmail = String(email || '').trim().toLowerCase();
@@ -567,14 +581,14 @@ app.get('/api/listings/:id/contact', authenticate, async (req, res) => {
   if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Listing ID is invalid.' });
   try {
     const result = await pool.query(
-      `SELECT u.email, u.phone, u.contact_display_consent
+      `SELECT u.email, u.phone, u.first_name AS "firstName", u.last_name AS "lastName", u.contact_display_consent
        FROM listings l JOIN users u ON u.id = l.user_id
        WHERE l.id = $1 AND l.status = 'ACTIVE' AND (l.expires_at IS NULL OR l.expires_at > NOW())`,
       [req.params.id],
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Listing not found.' });
-    const contact = result.rows[0];
-    if (!contact.contact_display_consent) {
+    const seller = result.rows[0];
+    if (!seller.contact_display_consent) {
       return res.status(403).json({ error: 'Seller has disabled contact display.' });
     }
     await pool.query(
@@ -582,7 +596,14 @@ app.get('/api/listings/:id/contact', authenticate, async (req, res) => {
        VALUES ($1, $2, 'CONTACT_REVEAL', 'REVEALED')`,
       [req.params.id, req.user.sub],
     );
-    return res.json({ contact });
+    return res.json({
+      contact: {
+        email: seller.email,
+        phone: seller.phone,
+        firstName: seller.firstName,
+        lastName: seller.lastName,
+      },
+    });
   } catch (error) {
     console.error('Contact reveal failed:', error);
     return res.status(500).json({ error: 'Unable to retrieve contact details.' });
@@ -783,14 +804,45 @@ app.patch('/api/listings/:id', authenticate, async (req, res) => {
 app.post('/api/listings/:id/sold', authenticate, async (req, res) => {
   if (!requireConfiguration(res)) return;
   if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Listing ID is invalid.' });
-  const result = await pool.query(
-    `UPDATE listings SET status = 'SOLD', updated_at = NOW()
-     WHERE id = $1 AND user_id = $2 AND status = 'ACTIVE' AND (expires_at IS NULL OR expires_at > NOW())
-     RETURNING id, status`,
-    [req.params.id, req.user.sub],
-  );
-  if (!result.rows[0]) return res.status(404).json({ error: 'Listing not found or already marked as sold.' });
-  return res.json({ listing: result.rows[0] });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `UPDATE listings SET status = 'SOLD', updated_at = NOW()
+       WHERE id = $1 AND user_id = $2 AND status = 'ACTIVE'
+         AND (expires_at IS NULL OR expires_at > NOW())
+       RETURNING id, status`,
+      [req.params.id, req.user.sub],
+    );
+    if (!result.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Listing not found or already marked as sold.' });
+    }
+    await client.query(
+      `INSERT INTO listing_review_events (listing_id, actor_id, event_type, decision)
+       VALUES ($1, $2, 'LISTING_SOLD', 'SOLD')`,
+      [req.params.id, req.user.sub],
+    );
+    await client.query(
+      `WITH declined AS (
+         UPDATE exchanges SET status = 'DECLINED', responded_at = NOW()
+         WHERE listing_id = $1 AND status = 'PENDING'
+         RETURNING id
+       )
+       INSERT INTO exchange_review_events (exchange_id, actor_id, old_status, new_status, reason)
+       SELECT id, $2, 'PENDING', 'DECLINED', 'Listing marked as sold'
+       FROM declined`,
+      [req.params.id, req.user.sub],
+    );
+    await client.query('COMMIT');
+    return res.json({ listing: result.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Mark listing as sold failed:', error);
+    return res.status(500).json({ error: 'Unable to mark the listing as sold.' });
+  } finally {
+    client.release();
+  }
 });
 
 app.get('/api/admin/listings/review-queue', authenticate, requireAdmin, async (req, res) => {
@@ -942,23 +994,65 @@ app.post('/api/analytics/visits', async (req, res) => {
   }
 });
 
-app.post('/api/reports', async (req, res) => {
+app.post('/api/reports', authenticate, async (req, res) => {
   if (!requireConfiguration(res)) return;
-  const { category, description, reporterEmail, listingId, userId } = req.body || {};
-  if (!category || !description) {
-    return res.status(400).json({ error: 'Category and description are required.' });
-  }
+  const validation = validateReportInput(req.body, req.user.sub);
+  if (validation.error) return res.status(400).json({ error: validation.error });
+  const { category, description, listingId, userId } = validation.value;
+  const client = await pool.connect();
   try {
-    const reporterId = req.user ? req.user.sub : null;
-    await pool.query(
-      `INSERT INTO reports (reporter_id, reporter_email, listing_id, user_id, category, description)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [reporterId, reporterEmail || null, listingId || null, userId || null, category, description],
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`report:${req.user.sub}`]);
+    const recentReports = await client.query(
+      `SELECT COUNT(*)::int AS count FROM reports
+       WHERE reporter_id = $1 AND created_at >= NOW() - INTERVAL '1 hour'`,
+      [req.user.sub],
     );
-    return res.status(201).json({ tracked: true });
+    if (recentReports.rows[0].count >= 5) {
+      await client.query('ROLLBACK');
+      res.set('Retry-After', '3600');
+      return res.status(429).json({ error: 'Too many reports. Please try again later.' });
+    }
+    const duplicate = await client.query(
+      `SELECT 1 FROM reports
+       WHERE reporter_id = $1 AND category = $2
+         AND listing_id IS NOT DISTINCT FROM $3::bigint
+         AND user_id IS NOT DISTINCT FROM $4::bigint
+         AND created_at >= NOW() - INTERVAL '10 minutes'
+       LIMIT 1`,
+      [req.user.sub, category, listingId, userId],
+    );
+    if (duplicate.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'You recently submitted a report for this target.' });
+    }
+    if (listingId) {
+      const target = await client.query('SELECT 1 FROM listings WHERE id = $1', [listingId]);
+      if (!target.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'The listing could not be found.' });
+      }
+    } else {
+      const target = await client.query('SELECT 1 FROM users WHERE id = $1', [userId]);
+      if (!target.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'The user could not be found.' });
+      }
+    }
+    const inserted = await client.query(
+      `INSERT INTO reports (reporter_id, reporter_email, listing_id, user_id, category, description)
+       VALUES ($1, NULL, $2, $3, $4, $5)
+       RETURNING id`,
+      [req.user.sub, listingId, userId, category, description],
+    );
+    await client.query('COMMIT');
+    return res.status(201).json({ reportId: inserted.rows[0].id });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Report submission failed:', error);
     return res.status(500).json({ error: 'Unable to submit the report.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -997,26 +1091,200 @@ app.get('/api/users/me', authenticate, async (req, res) => {
 });
 
 app.post('/api/exchanges', authenticate, async (req, res) => {
-
   if (!requireConfiguration(res)) return;
-  const { listingId, offeredBookTitle, offeredBookCourse, conditionPreference, notes } = req.body || {};
-  if (!listingId || !offeredBookTitle || !offeredBookCourse) {
-    return res.status(400).json({ error: 'Listing ID, offered book title, and course are required.' });
-  }
-  if (!isValidListingId(listingId)) return res.status(400).json({ error: 'Listing ID is invalid.' });
+  const validation = validateExchangeInput(req.body);
+  if (validation.error) return res.status(400).json({ error: validation.error });
+  const { listingId, offeredBookTitle, offeredBookCourse, conditionPreference, notes } = validation.value;
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
-      `INSERT INTO exchanges (requester_id, listing_id, offered_book_title, offered_book_course, condition_preference, notes)
-       SELECT $1, l.id, $3, $4, $5, $6 FROM listings l
-       WHERE l.id = $2 AND l.status = 'ACTIVE' AND (l.expires_at IS NULL OR l.expires_at > NOW())
-       RETURNING id`,
+    await client.query('BEGIN');
+    const listing = await client.query(
+      `SELECT id, user_id, status, is_trade, expires_at
+       FROM listings WHERE id = $1 FOR UPDATE`,
+      [listingId],
+    );
+    const target = listing.rows[0];
+    if (!target || target.status !== 'ACTIVE' || (target.expires_at && new Date(target.expires_at) <= new Date())) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Approved active listing not found.' });
+    }
+    if (!target.is_trade) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This listing is not accepting exchange requests.' });
+    }
+    if (String(target.user_id) === String(req.user.sub)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'You cannot request an exchange for your own listing.' });
+    }
+    const accepted = await client.query(
+      `SELECT 1 FROM exchanges WHERE listing_id = $1 AND status = 'ACCEPTED' LIMIT 1`,
+      [listingId],
+    );
+    if (accepted.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'The owner has already accepted an exchange for this listing.' });
+    }
+    const duplicate = await client.query(
+      `SELECT 1 FROM exchanges
+       WHERE requester_id = $1 AND listing_id = $2 AND status = 'PENDING'
+       LIMIT 1`,
+      [req.user.sub, listingId],
+    );
+    if (duplicate.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'You already have a pending request for this listing.' });
+    }
+    const rate = await client.query(
+      `SELECT COUNT(*)::int AS count FROM exchanges
+       WHERE requester_id = $1 AND created_at >= NOW() - INTERVAL '1 hour'`,
+      [req.user.sub],
+    );
+    if (rate.rows[0].count >= 10) {
+      await client.query('ROLLBACK');
+      res.set('Retry-After', '3600');
+      return res.status(429).json({ error: 'Too many exchange requests. Please try again later.' });
+    }
+    const inserted = await client.query(
+      `INSERT INTO exchanges
+         (requester_id, listing_id, offered_book_title, offered_book_course,
+          condition_preference, notes)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, status, created_at AS "createdAt"`,
       [req.user.sub, listingId, offeredBookTitle, offeredBookCourse, conditionPreference, notes],
     );
-    if (!result.rows[0]) return res.status(404).json({ error: 'Approved active listing not found.' });
-    return res.status(201).json({ exchangeId: result.rows[0].id });
+    await client.query(
+      `INSERT INTO exchange_review_events (exchange_id, actor_id, old_status, new_status)
+       VALUES ($1, $2, NULL, 'PENDING')`,
+      [inserted.rows[0].id, req.user.sub],
+    );
+    await client.query('COMMIT');
+    return res.status(201).json({ exchange: { ...inserted.rows[0], listingId } });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Exchange request failed:', error);
     return res.status(500).json({ error: 'Unable to post exchange request.' });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/my-exchanges', authenticate, async (req, res) => {
+  if (!requireConfiguration(res)) return;
+  try {
+    const [outgoing, incoming] = await Promise.all([
+      pool.query(
+        `SELECT e.id, e.listing_id AS "listingId", l.title AS "listingTitle",
+                l.status AS "listingStatus", e.offered_book_title AS "offeredBookTitle",
+                e.offered_book_course AS "offeredBookCourse",
+                e.condition_preference AS "conditionPreference", e.notes, e.status,
+                e.created_at AS "createdAt", e.responded_at AS "respondedAt",
+                'OUTGOING' AS direction
+         FROM exchanges e JOIN listings l ON l.id = e.listing_id
+         WHERE e.requester_id = $1
+         ORDER BY e.created_at DESC LIMIT 100`,
+        [req.user.sub],
+      ),
+      pool.query(
+        `SELECT e.id, e.listing_id AS "listingId", l.title AS "listingTitle",
+                l.status AS "listingStatus", e.offered_book_title AS "offeredBookTitle",
+                e.offered_book_course AS "offeredBookCourse",
+                e.condition_preference AS "conditionPreference", e.notes, e.status,
+                e.created_at AS "createdAt", e.responded_at AS "respondedAt",
+                requester.first_name AS "requesterFirstName",
+                requester.last_name AS "requesterLastName",
+                'INCOMING' AS direction
+         FROM exchanges e JOIN listings l ON l.id = e.listing_id
+         JOIN users requester ON requester.id = e.requester_id
+         WHERE l.user_id = $1
+         ORDER BY e.created_at DESC LIMIT 100`,
+        [req.user.sub],
+      ),
+    ]);
+    return res.json({ outgoing: outgoing.rows, incoming: incoming.rows });
+  } catch (error) {
+    console.error('Exchange request retrieval failed:', error);
+    return res.status(500).json({ error: 'Unable to load exchange requests.' });
+  }
+});
+
+app.patch('/api/exchanges/:id', authenticate, async (req, res) => {
+  if (!requireConfiguration(res)) return;
+  if (!isValidListingId(req.params.id)) return res.status(400).json({ error: 'Exchange ID is invalid.' });
+  const decision = req.body?.status;
+  if (!['ACCEPTED', 'DECLINED'].includes(decision)) {
+    return res.status(400).json({ error: 'Exchange status must be ACCEPTED or DECLINED.' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const current = await client.query(
+      `SELECT e.id, e.status, e.listing_id, l.user_id AS owner_id,
+              l.status AS listing_status, l.expires_at
+       FROM exchanges e JOIN listings l ON l.id = e.listing_id
+       WHERE e.id = $1
+       FOR UPDATE OF e, l`,
+      [req.params.id],
+    );
+    const exchange = current.rows[0];
+    if (!exchange) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Exchange request not found.' });
+    }
+    if (String(exchange.owner_id) !== String(req.user.sub)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Only the listing owner can respond to this request.' });
+    }
+    if (exchange.status !== 'PENDING') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'This exchange request has already been decided.' });
+    }
+    if (exchange.listing_status !== 'ACTIVE'
+        || (exchange.expires_at && new Date(exchange.expires_at) <= new Date())) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'This listing is no longer available for an exchange.' });
+    }
+    if (decision === 'ACCEPTED') {
+      const accepted = await client.query(
+        `SELECT 1 FROM exchanges
+         WHERE listing_id = $1 AND status = 'ACCEPTED' AND id <> $2
+         LIMIT 1`,
+        [exchange.listing_id, exchange.id],
+      );
+      if (accepted.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Another exchange request was already accepted.' });
+      }
+    }
+    await client.query(
+      `UPDATE exchanges SET status = $1, responded_at = NOW() WHERE id = $2`,
+      [decision, exchange.id],
+    );
+    await client.query(
+      `INSERT INTO exchange_review_events (exchange_id, actor_id, old_status, new_status)
+       VALUES ($1, $2, 'PENDING', $3)`,
+      [exchange.id, req.user.sub, decision],
+    );
+    if (decision === 'ACCEPTED') {
+      await client.query(
+        `WITH declined AS (
+           UPDATE exchanges SET status = 'DECLINED', responded_at = NOW()
+           WHERE listing_id = $1 AND id <> $2 AND status = 'PENDING'
+           RETURNING id
+         )
+         INSERT INTO exchange_review_events (exchange_id, actor_id, old_status, new_status, reason)
+         SELECT id, $3, 'PENDING', 'DECLINED', 'Another exchange request was accepted'
+         FROM declined`,
+        [exchange.listing_id, exchange.id, req.user.sub],
+      );
+    }
+    await client.query('COMMIT');
+    return res.json({ exchange: { id: exchange.id, status: decision } });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Exchange decision failed:', error);
+    return res.status(500).json({ error: 'Unable to update the exchange request.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1357,6 +1625,10 @@ const schema = `
     status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'REVIEWED', 'RESOLVED')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
+  CREATE INDEX IF NOT EXISTS reports_reporter_created_idx
+    ON reports (reporter_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS reports_target_created_idx
+    ON reports (listing_id, user_id, created_at DESC);
   CREATE TABLE IF NOT EXISTS report_review_events (
     id BIGSERIAL PRIMARY KEY,
     report_id BIGINT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
@@ -1377,10 +1649,24 @@ const schema = `
     condition_preference TEXT,
     notes TEXT,
     status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'ACCEPTED', 'DECLINED')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    responded_at TIMESTAMPTZ
   );
+  ALTER TABLE exchanges ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ;
   CREATE INDEX IF NOT EXISTS exchanges_listing_idx ON exchanges (listing_id);
   CREATE INDEX IF NOT EXISTS exchanges_requester_idx ON exchanges (requester_id);
+  CREATE INDEX IF NOT EXISTS exchanges_requester_created_idx ON exchanges (requester_id, created_at DESC);
+  CREATE TABLE IF NOT EXISTS exchange_review_events (
+    id BIGSERIAL PRIMARY KEY,
+    exchange_id BIGINT NOT NULL REFERENCES exchanges(id) ON DELETE CASCADE,
+    actor_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    old_status TEXT CHECK (old_status IN ('PENDING', 'ACCEPTED', 'DECLINED')),
+    new_status TEXT NOT NULL CHECK (new_status IN ('PENDING', 'ACCEPTED', 'DECLINED')),
+    reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS exchange_review_events_exchange_idx
+    ON exchange_review_events (exchange_id, created_at DESC);
 `;
 
 app.use((error, req, res, next) => {

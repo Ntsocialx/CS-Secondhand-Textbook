@@ -5,7 +5,7 @@ require('dotenv').config();
 
 async function main() {
   const email = String(process.argv[2] || '').trim().toLowerCase();
-  if (!/^[^@\s]+@(?:student\.tut\.ac\.za|tut\.ac\.za|tut4life\.ac\.za|student\.campus\.edu)$/.test(email)) {
+  if (!/^[^@\s]+@(?:student\.tut\.ac\.za|tut\.ac\.za|tut4life\.ac\.za)$/.test(email)) {
     throw new Error('Usage: npm run admin:promote -- <registered-tut-email>');
   }
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL must be configured in the server environment.');

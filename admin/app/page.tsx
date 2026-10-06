@@ -4,9 +4,9 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useSession } from "next-auth/react";
 import { AdminNavigation } from "@/components/AdminNavigation";
-import { fetchJson, withBearer } from "@/lib/api";
+import { fetchJson } from "@/lib/api";
 
-const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000";
+const marketplaceUrl = process.env.NEXT_PUBLIC_MARKETPLACE_URL ?? "http://localhost:3000";
 
 type Overview = {
   users: { total: number; registered_last_30_days: number };
@@ -37,15 +37,14 @@ export default function AdminOverviewPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const token = session?.user.accessToken;
-    if (status !== "authenticated" || session?.user.role !== "ADMIN" || !token) return;
+    if (status !== "authenticated" || session?.user.role !== "ADMIN") return;
     let cancelled = false;
-    fetchJson<Overview>(`${apiUrl}/api/admin/overview`, withBearer(token))
+    fetchJson<Overview>("/api/backend/admin/overview")
       .then((data) => { if (!cancelled) setOverview(data); })
       .catch((requestError: unknown) => { if (!cancelled) setError(requestError instanceof Error ? requestError.message : "Unable to load admin overview."); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [session?.user.accessToken, session?.user.role, status]);
+  }, [session?.user.role, status]);
 
   if (status === "loading") return <main className="p-8">Checking admin access...</main>;
   if (!session || session.user.role !== "ADMIN") return <main className="p-8"><p>Admin access is required.</p><Link href="/" className="mt-3 inline-block text-sm text-[#2864ed]">Return home</Link></main>;
@@ -55,9 +54,9 @@ export default function AdminOverviewPage() {
       <div className="mx-auto max-w-6xl">
         <header className="mb-6 flex flex-wrap items-end justify-between gap-4">
           <div><p className="text-[10px] font-bold uppercase tracking-[0.16em] text-[#2864ed]">Campus Exchange</p><h1 className="mt-2 text-3xl font-extrabold">Admin control center</h1><p className="mt-2 text-sm text-[#60728d]">Private operations overview. All administrative actions are checked by the API.</p></div>
-          <Link href="/" className="rounded-lg border border-[#cbd8eb] bg-white px-4 py-2 text-xs font-bold">View marketplace</Link>
+          <a href={marketplaceUrl} className="rounded-lg border border-[#cbd8eb] bg-white px-4 py-2 text-xs font-bold">View marketplace</a>
         </header>
-        <AdminNavigation active="/admin" />
+        <AdminNavigation active="/" />
         {error && <p role="alert" className="mt-5 rounded-lg bg-[#fff0bf] p-3 text-sm text-[#895200]">{error}</p>}
         {loading ? <p className="mt-8 text-sm text-[#718198]">Loading overview...</p> : overview && (
           <>
@@ -74,22 +73,22 @@ export default function AdminOverviewPage() {
               <h2 className="mb-3 text-sm font-bold">Listings and reviews</h2>
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
                 <Metric label="Active approved listings" value={overview.listings.active} />
-                <Metric label="Awaiting payment review" value={overview.listings.pending_payment} href="/admin/listings" />
-                <Metric label="Awaiting content review" value={overview.listings.pending_content_review} href="/admin/listings" />
+                <Metric label="Awaiting payment review" value={overview.listings.pending_payment} href="/listings" />
+                <Metric label="Awaiting content review" value={overview.listings.pending_content_review} href="/listings" />
                 <Metric label="Rejected listings" value={overview.listings.rejected} />
                 <Metric label="Sold listings" value={overview.listings.sold} />
-                <Metric label="Expired periods" value={overview.listings.expired} href="/admin/fees" />
+                <Metric label="Expired periods" value={overview.listings.expired} href="/fees" />
               </div>
             </section>
             <section className="mt-7">
               <h2 className="mb-3 text-sm font-bold">Reports and listing fees</h2>
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                <Metric label="Open reports" value={overview.reports.open} href="/admin/reports" />
-                <Metric label="Reviewed reports" value={overview.reports.reviewed} href="/admin/reports" />
-                <Metric label="Resolved reports" value={overview.reports.resolved} href="/admin/reports" />
-                <Metric label="Verified fee periods" value={overview.fees.verified_periods} href="/admin/fees" />
-                <Metric label="Currently active fee periods" value={overview.fees.active_periods} href="/admin/fees" />
-                <Metric label="Proofs awaiting check" value={overview.fees.pending_proofs} href="/admin/listings" />
+                <Metric label="Open reports" value={overview.reports.open} href="/reports" />
+                <Metric label="Reviewed reports" value={overview.reports.reviewed} href="/reports" />
+                <Metric label="Resolved reports" value={overview.reports.resolved} href="/reports" />
+                <Metric label="Verified fee periods" value={overview.fees.verified_periods} href="/fees" />
+                <Metric label="Currently active fee periods" value={overview.fees.active_periods} href="/fees" />
+                <Metric label="Proofs awaiting check" value={overview.fees.pending_proofs} href="/listings" />
               </div>
               <p className="mt-3 text-xs text-[#718198]">Verified listing fees: R{overview.fees.verified_listing_fees_zar}. This is a count-based estimate, not bank reconciliation or proof of funds received. Each fee is R{overview.feeTerms.amountZar} for {overview.feeTerms.periodDays} days; automatic renewal is off.</p>
             </section>

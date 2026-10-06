@@ -4,6 +4,8 @@ import Link from "next/link";
 import Image from "next/image";
 import { useSession } from "next-auth/react";
 
+const adminPortalUrl = process.env.NEXT_PUBLIC_ADMIN_APP_URL ?? "http://localhost:3001";
+
 export function Logo() {
   return (
     <Link href="/" className="flex items-center gap-3 text-[18px] font-extrabold tracking-tight text-[#142039]" aria-label="Campus Exchange home">
@@ -38,7 +40,7 @@ export function Header({ active = "Home" }: { active?: string }) {
             </Link>
           ))}
           {session?.user?.role === "ADMIN" && (
-            <Link href="/admin" className="py-4 font-bold text-[#2864ed] hover:text-[#173fae]">Admin</Link>
+            <Link href={adminPortalUrl} className="py-4 font-bold text-[#2864ed] hover:text-[#173fae]">Admin portal</Link>
           )}
         </nav>
         <div className="flex items-center gap-4 text-[#64748b]">

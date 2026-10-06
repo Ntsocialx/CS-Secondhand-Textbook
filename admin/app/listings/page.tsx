@@ -5,9 +5,8 @@ import Image from "next/image";
 import { useEffect, useState } from "react";
 import { useSession } from "next-auth/react";
 import { AdminNavigation } from "@/components/AdminNavigation";
-import { fetchJson, withBearer } from "@/lib/api";
+import { fetchJson } from "@/lib/api";
 
-const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000";
 const reviewChecks = [
   "Appears to be a genuine physical book, not a copy or counterfeit.",
   "No obvious stolen, unauthorized, or otherwise prohibited material is offered.",
@@ -52,13 +51,8 @@ export default function AdminListingReviewPage() {
   const [busyId, setBusyId] = useState<string | null>(null);
 
   async function loadQueue() {
-    const token = session?.user.accessToken;
-    if (!token) return;
     try {
-      const result = await fetchJson<{ listings: ReviewListing[] }>(
-        `${apiUrl}/api/admin/listings/review-queue`,
-        withBearer(token),
-      );
+      const result = await fetchJson<{ listings: ReviewListing[] }>("/api/backend/admin/listings/review-queue");
       setListings(result.listings);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Unable to load listing reviews.");
@@ -68,27 +62,23 @@ export default function AdminListingReviewPage() {
   }
 
   useEffect(() => {
-    const token = session?.user.accessToken;
-    if (status !== "authenticated" || session?.user.role !== "ADMIN" || !token) return;
+    if (status !== "authenticated" || session?.user.role !== "ADMIN") return;
     let cancelled = false;
-    fetchJson<{ listings: ReviewListing[] }>(`${apiUrl}/api/admin/listings/review-queue`, withBearer(token))
+    fetchJson<{ listings: ReviewListing[] }>("/api/backend/admin/listings/review-queue")
       .then((result) => { if (!cancelled) setListings(result.listings); })
       .catch((requestError: unknown) => { if (!cancelled) setError(requestError instanceof Error ? requestError.message : "Unable to load listing reviews."); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [session?.user.accessToken, session?.user.role, status]);
+  }, [session?.user.role, status]);
 
   useEffect(() => () => {
     if (proof) URL.revokeObjectURL(proof.url);
   }, [proof]);
 
   async function showProof(id: string) {
-    if (!session?.user.accessToken) return;
     setError("");
     try {
-      const response = await fetch(`${apiUrl}/api/admin/listings/${id}/payment-proof`, {
-        headers: { Authorization: `Bearer ${session.user.accessToken}` },
-      });
+      const response = await fetch(`/api/backend/admin/listings/${id}/payment-proof`, { cache: "no-store" });
       if (!response.ok) {
         const data = await response.json().catch(() => null);
         throw new Error(data?.error || `Unable to load proof (${response.status}).`);
@@ -101,7 +91,6 @@ export default function AdminListingReviewPage() {
   }
 
   async function decide(id: string, type: "payment" | "moderation", decision: "VERIFIED" | "APPROVED" | "REJECTED") {
-    if (!session?.user.accessToken) return;
     const reason = reasons[id]?.trim() ?? "";
     if (decision === "REJECTED" && !reason) {
       setError("Add a clear reason before rejecting a payment proof or listing.");
@@ -114,11 +103,11 @@ export default function AdminListingReviewPage() {
       const body = isPayment
         ? { decision, reason }
         : { decision, reason, checklist: checks[id] ?? [] };
-      await fetchJson(`${apiUrl}/api/admin/listings/${id}/${isPayment ? "payment-review" : "moderation-review"}`, withBearer(session.user.accessToken, {
+      await fetchJson(`/api/backend/admin/listings/${id}/${isPayment ? "payment-review" : "moderation-review"}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-      }));
+      });
       setProof((current) => {
         if (current?.id === id) URL.revokeObjectURL(current.url);
         return current?.id === id ? null : current;
@@ -140,10 +129,10 @@ export default function AdminListingReviewPage() {
     <main className="min-h-screen bg-[#f7f9fc] px-5 py-8 text-[#142039] sm:px-8">
       <div className="mx-auto max-w-5xl">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div><Link href="/admin/analytics" className="text-xs font-bold text-[#2161ee]">← Admin dashboard</Link><h1 className="mt-3 text-2xl font-extrabold">Listing review queue</h1></div>
+          <div><Link href="/analytics" className="text-xs font-bold text-[#2161ee]">← Admin dashboard</Link><h1 className="mt-3 text-2xl font-extrabold">Listing review queue</h1></div>
           <button type="button" onClick={() => void loadQueue()} className="rounded-lg border border-[#cbd8eb] bg-white px-4 py-2 text-xs font-bold">Refresh queue</button>
         </div>
-        <div className="mt-5"><AdminNavigation active="/admin/listings" /></div>
+        <div className="mt-5"><AdminNavigation active="/listings" /></div>
         <p className="mt-2 text-sm text-[#60728d]">Verify transfer receipts and review book listings as separate decisions. Only approved, unexpired listings are visible in Browse.</p>
         {error && <p role="alert" className="mt-5 rounded-lg bg-[#fff0bf] p-3 text-sm text-[#895200]">{error}</p>}
         {loading ? <p className="mt-8 text-sm text-[#718198]">Loading submissions...</p> : listings.length === 0 ? (

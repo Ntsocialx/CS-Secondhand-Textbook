@@ -1,4 +1,4 @@
-const VERIFIED_STUDENT_DOMAINS = ["student.tut.ac.za", "tut.ac.za", "tut4life.ac.za", "student.campus.edu"];
+const VERIFIED_STUDENT_DOMAINS = ["student.tut.ac.za", "tut.ac.za", "tut4life.ac.za"];
 
 export function isVerifiedStudentEmail(email: string): boolean {
   const normalizedEmail = email.trim().toLowerCase();

@@ -58,9 +58,10 @@ export default function BookDetails() {
             <h2 className="mt-6 text-[10px] font-bold uppercase text-[#718198]">Campus</h2>
             <p className="mt-2 text-xs">{listing.campus}</p>
             <div className="mt-5 grid gap-3 sm:grid-cols-2">
-              <Link href={`/seller?listing=${listing.id}`} className="rounded-lg bg-[#2864ed] py-3 text-center text-xs font-bold text-white">View Seller Contact</Link>
+              <Link href={`/seller?listing=${listing.id}`} className="rounded-lg bg-[#2864ed] py-3 text-center text-xs font-bold text-white">Contact Seller</Link>
               <Link href={`/report?listing=${listing.id}`} className="rounded-lg bg-[#e45757] py-3 text-center text-xs font-bold text-white">Report a problem</Link>
             </div>
+            {listing.isTrade && <Link href={`/exchange?listing=${listing.id}`} className="mt-3 block rounded-lg border border-[#2864ed] bg-white py-3 text-center text-xs font-bold text-[#2864ed]">Request an exchange</Link>}
             <div className="mt-6 rounded-xl bg-[#fff0bf] p-4 text-[10px] leading-4 text-[#895200]"><b>Meet safely</b><br />Meet in a public on-campus space during daylight hours, confirm sale or exchange details, and inspect the book before completing the exchange.</div>
           </div>
         </div>

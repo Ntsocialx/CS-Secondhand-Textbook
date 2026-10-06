@@ -12,21 +12,17 @@ type Summary = {
   daily: { date: string; visits: number }[];
 };
 
-const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000";
-
 export default function AnalyticsPage() {
   const { data: session, status } = useSession();
   const [summary, setSummary] = useState<Summary | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (status !== "authenticated" || session.user.role !== "ADMIN" || !session.user.accessToken) return;
-    fetchJson<Summary>(`${apiUrl}/api/analytics/summary`, {
-      headers: { Authorization: `Bearer ${session.user.accessToken}` },
-    }).then(setSummary).catch((requestError: unknown) => {
+    if (status !== "authenticated" || session.user.role !== "ADMIN") return;
+    fetchJson<Summary>("/api/backend/analytics/summary").then(setSummary).catch((requestError: unknown) => {
       setError(requestError instanceof Error ? requestError.message : "Unable to load analytics.");
     });
-  }, [session, status]);
+  }, [session?.user.role, status]);
 
   if (status === "loading") return <main className="p-10">Loading...</main>;
   if (!session || session.user.role !== "ADMIN") {
@@ -36,10 +32,9 @@ export default function AnalyticsPage() {
   return (
     <main className="min-h-screen bg-slate-100 p-6 text-slate-900 sm:p-10">
       <div className="mx-auto max-w-5xl">
-        <Link href="/" className="text-sm font-semibold text-indigo-600">← Campus Exchange</Link>
         <h1 className="mt-5 text-4xl font-semibold">Visitor analytics</h1>
-        <Link href="/admin" className="mt-3 inline-block text-sm font-semibold text-indigo-600">← Admin control center</Link>
-        <div className="mt-5"><AdminNavigation active="/admin/analytics" /></div>
+        <Link href="/" className="mt-3 inline-block text-sm font-semibold text-indigo-600">← Admin control center</Link>
+        <div className="mt-5"><AdminNavigation active="/analytics" /></div>
         <p className="mt-2 text-slate-600">Private dashboard. IP addresses are stored only as salted hashes.</p>
         {error && <p className="mt-6 rounded-xl bg-red-50 p-4 text-red-700">{error}</p>}
         {summary && (
