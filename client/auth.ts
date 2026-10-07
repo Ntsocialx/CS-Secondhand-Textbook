@@ -1,9 +1,13 @@
 import NextAuth, { type NextAuthOptions } from "next-auth";
 import Credentials from "next-auth/providers/credentials";
 
-const authBaseUrl = process.env.NEXTAUTH_URL
-  ?? (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "http://localhost:3000");
-const authProxyUrl = new URL("/api/auth/login", authBaseUrl).toString();
+const serviceUnavailableError = "SERVICE_UNAVAILABLE";
+const configuredAuthBaseUrl = process.env.NEXTAUTH_URL
+  ?? (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined);
+// Production never falls back to localhost; local development keeps its default.
+const authBaseUrl = configuredAuthBaseUrl
+  ?? (process.env.NODE_ENV === "production" ? null : "http://localhost:3000");
+const authProxyUrl = authBaseUrl ? new URL("/api/auth/login", authBaseUrl).toString() : null;
 
 export const authOptions: NextAuthOptions = {
   secret: process.env.NEXTAUTH_SECRET,
@@ -18,23 +22,30 @@ export const authOptions: NextAuthOptions = {
       },
       async authorize(credentials) {
         if (!credentials) return null;
-        const response = await fetch(authProxyUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            email: credentials.email,
-            password: credentials.password,
-            consent: {
-              accepted: credentials.consent === "true",
-              version: "1.0",
-              displayContactDetails: credentials.displayContactDetails === "true",
-            },
-          }),
-        });
+        if (!authProxyUrl) throw new Error(serviceUnavailableError);
+        let response: Response;
+        try {
+          response = await fetch(authProxyUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              email: credentials.email,
+              password: credentials.password,
+              consent: {
+                accepted: credentials.consent === "true",
+                version: "1.0",
+                displayContactDetails: credentials.displayContactDetails === "true",
+              },
+            }),
+          });
+        } catch {
+          throw new Error(serviceUnavailableError);
+        }
         if (!response.ok) {
           if (response.status === 429) {
             throw new Error("Too many failed login attempts. Try again in about 5 minutes.");
           }
+          if (response.status >= 500) throw new Error(serviceUnavailableError);
           return null;
         }
         const payload = await response.json();

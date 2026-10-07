@@ -10,6 +10,13 @@ const { validateExchangeInput, validateReportInput } = require('./lib/marketplac
 require('dotenv').config();
 
 const app = express();
+// Behind a host's proxy (Render) the real client address is in X-Forwarded-For. Trust that many
+// hops so rate limiting and login lockout key on it. Override with TRUST_PROXY (0 disables).
+const configuredProxyHops = Number.parseInt(
+  process.env.TRUST_PROXY ?? (process.env.NODE_ENV === 'production' ? '1' : '0'),
+  10,
+);
+app.set('trust proxy', Number.isInteger(configuredProxyHops) && configuredProxyHops > 0 ? configuredProxyHops : false);
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET;
 const POPIA_CONSENT_VERSION = '1.0';

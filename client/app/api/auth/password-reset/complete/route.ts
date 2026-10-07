@@ -1,8 +1,15 @@
 import { NextResponse } from "next/server";
 
-const apiUrl = process.env.API_URL ?? "http://localhost:5000";
+import { getServerApiUrl } from "@/lib/serverApiUrl";
 
 export async function POST(request: Request) {
+  const apiUrl = getServerApiUrl();
+  if (!apiUrl) {
+    return NextResponse.json(
+      { error: "Password reset is temporarily unavailable. Please try again later." },
+      { status: 503, headers: { "Cache-Control": "no-store" } },
+    );
+  }
   try {
     const body: unknown = await request.json();
     const response = await fetch(`${apiUrl}/api/auth/password-reset/complete`, {

@@ -8,8 +8,6 @@ import { ConsentModal } from "@/components/ConsentModal";
 import { fetchJson } from "@/lib/api";
 import { isVerifiedStudentEmail, verifiedStudentDomainHint } from "@/lib/studentEmail";
 
-const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000";
-
 export function AuthForm({ mode }: { mode: "login" | "register" }) {
   const router = useRouter();
   const [email, setEmail] = useState("");
@@ -56,7 +54,7 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
     setBusy(true);
     try {
       if (mode === "register") {
-        await fetchJson(`${apiUrl}/api/auth/register`, {
+        await fetchJson("/api/auth/register", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email, password, phone, firstName, lastName, gender, campus, faculty, university, consent: { accepted, version: "1.0", displayContactDetails } }),
@@ -72,6 +70,9 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
       if (result?.error) {
         if (result.error.toLowerCase().includes("too many")) {
           throw new Error("Too many failed login attempts. Try again in about 5 minutes.");
+        }
+        if (result.error.includes("SERVICE_UNAVAILABLE")) {
+          throw new Error("The sign-in service is unavailable. Try again shortly.");
         }
         throw new Error("Unable to sign in with those details.");
       }
