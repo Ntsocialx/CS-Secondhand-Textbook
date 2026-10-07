@@ -28,7 +28,9 @@ const LOGIN_LOCKOUT_MS = 5 * 60 * 1000;
 const pool = process.env.DATABASE_URL
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
-      ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+      ssl: process.env.NODE_ENV === 'production' || process.env.DATABASE_URL.includes('neon.tech')
+        ? { rejectUnauthorized: false }
+        : false,
     })
   : null;
 
