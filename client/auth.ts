@@ -1,7 +1,9 @@
 import NextAuth, { type NextAuthOptions } from "next-auth";
 import Credentials from "next-auth/providers/credentials";
 
-const authProxyUrl = `${process.env.NEXTAUTH_URL ?? "http://localhost:3000"}/api/auth/login`;
+const authBaseUrl = process.env.NEXTAUTH_URL
+  ?? (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "http://localhost:3000");
+const authProxyUrl = new URL("/api/auth/login", authBaseUrl).toString();
 
 export const authOptions: NextAuthOptions = {
   secret: process.env.NEXTAUTH_SECRET,

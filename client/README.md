@@ -34,3 +34,13 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+### Vercel Environment Variables
+
+Configure these variables in the Vercel project that deploys the student client. Set them for each environment where authentication should work, then redeploy:
+
+- `NEXTAUTH_SECRET`: a unique, high-entropy secret. Keep it in Vercel's encrypted environment settings; never commit or share it.
+- `NEXTAUTH_URL`: the canonical HTTPS URL of the student client, such as `https://cs-secondhand-textbook-dy72.vercel.app`.
+- `API_URL`: the HTTPS origin of the deployed Express API, without an `/api` suffix.
+
+The client can derive its callback host from Vercel's `VERCEL_URL` when `NEXTAUTH_URL` is not set, but the canonical URL should still be configured for NextAuth. Do not use the admin app's URL for the student client's `NEXTAUTH_URL`.
